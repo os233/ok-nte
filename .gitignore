@@ -78,3 +78,8 @@ site/
 !mid_lib/
 mid_lib/*
 !mid_lib/public
+
+# WorkBuddy 本地数据(个人环境记忆与日志, 不提交)
+# 保留 skills/ 例外, 以便项目级技能可在团队间共享
+.workbuddy-ai/*
+!.workbuddy-ai/skills/
