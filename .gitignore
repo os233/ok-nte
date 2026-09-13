@@ -72,6 +72,9 @@ ok_tasks/
 ok_import/
 temp_images/
 .ruff_cache
+.mypy_cache/
+.pytest_cache/
+.zcode/
 site/
 
 #midi

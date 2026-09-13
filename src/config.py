@@ -203,6 +203,7 @@ config = {
         ["src.tasks.WhirlwindTask", "WhirlwindTask"],
         ["src.tasks.DSDFarmTask", "DSDFarmTask"],
         ["src.tasks.AutoBidAuctionTask", "AutoBidAuctionTask"],
+        ["src.tasks.AuctionHouseUpkeepTask", "AuctionHouseUpkeepTask"],
         ["src.tasks.VolleyballTask", "VolleyballTask"],
         # 测试相关
         ["src.tasks.CombatDetectionTestTask", "CombatDetectionTestTask"],
