@@ -274,17 +274,47 @@ class TestCustomChar(TaskTestCase):
 
         tab.on_scan_done(mock_results)
 
-        # 分析 Slot UI 變化
         # 槽位 0: 應該顯示匹配成功
         self.assertIn("scan_char_1", tab.slots[0].status.text())
         self.assertFalse(tab.slots[0].btn_act.isHidden())
+        self.assertFalse(tab.slots[0].btn_relink.isHidden())
 
         # 槽位 1: 應該顯示未匹配，並出現可關聯的按鈕
         self.assertEqual(tab.slots[1].status.text(), tab.slots[1].tr_unrecognized)
         self.assertFalse(tab.slots[1].btn_act.isHidden())
+        self.assertTrue(tab.slots[1].btn_relink.isHidden())
 
         # 槽位 2: 未收到掃描結果，應被清空並寫著無畫面
         self.assertEqual(tab.slots[2].status.text(), tab.tr_no_feature)
+        self.assertTrue(tab.slots[2].btn_relink.isHidden())
+
+    def test_team_manager_tab_relink_when_mismatched(self):
+        tab = TeamManagerTab(manager=self.manager)
+        combo_id = self.manager.add_combo("combo_test", "skill")
+        wrong_char_id = self.manager.create_character("wrong_char", combo_id)
+
+        fake_mat = np.zeros((10, 10, 3), dtype=np.uint8)
+        slot = tab.slots[0]
+        slot.update_result(fake_mat, 1920, 1080, wrong_char_id, 0.64)
+
+        # 匹配成功但可能是误判, 应该显示加入特征按钮与不是该角色链接
+        self.assertFalse(slot.btn_act.isHidden())
+        self.assertFalse(slot.btn_relink.isHidden())
+
+        dialog = MagicMock()
+        dialog.exec.return_value = True
+        dialog.get_data.return_value = ("correct_char", "", "", "")
+
+        with patch("src.ui.TeamManagerTab.NewCharDialog", return_value=dialog):
+            slot.on_relink()
+
+        self.assertNotEqual(slot.current_match_char_id, wrong_char_id)
+        linked_info = self.manager.get_character_info_by_id(slot.current_match_char_id)
+        assert linked_info is not None
+        self.assertEqual(linked_info["char_name"], "correct_char")
+        self.assertEqual(slot.current_confidence, 1.0)
+        self.assertFalse(slot.btn_act.isEnabled())
+        self.assertTrue(slot.btn_relink.isHidden())
 
     def test_team_manager_tab_disables_add_feature_after_first_link(self):
         tab = TeamManagerTab(manager=self.manager)

@@ -299,6 +299,32 @@ def combat_plan(self, context):
 Common APIs:
 
 - `context.request_route(...)`: A fixed-order coordination route.
+
+`FollowupStep.for_switch(target, wait_for_turn=True)` switches in and waits for the target's normal turn by default:
+
+```python
+context.request_route([
+    FollowupStep.for_switch(a),
+    FollowupStep.for_action(b, ActionSlot.ULTIMATE),
+])
+```
+
+A finishes its normal entry flow before the route advances to B's ultimate.
+If A is already on field, it still runs its turn. No first action or entry reaction is
+required, and action permissions and reservations still apply. A turn uses the normal
+flow termination conditions and action limit, including field-time fallback when no
+action succeeds. Completion does not require a particular skill to succeed. Exceptions
+do not complete the step; an expired or replaced route is not advanced afterward.
+
+For arrival-only behavior, use `FollowupStep.for_switch(a, wait_for_turn=False)`.
+The step completes on successful arrival or when the target is already on field.
+A single-step route then releases normal flow; a multi-step route advances immediately,
+**without waiting for A's turn or guaranteeing that A performs any action**.
+
+Both modes inherit strict-route priority and lifetime. A new route replaces the existing
+route, so this is not merely a higher-priority `request_switch()`. Use the latter for
+ordinary independent switch requests.
+
 - `context.request_switch(...)`: Request that the next ordinary dispatch switches to a character.
 - `context.request_role(...)`: Request that the next ordinary dispatch switches to a character with a team role. When several characters match, ordinary switch scoring chooses one. It does not specify an action or interrupt the current entry flow.
 - `context.reserve_actions(...)`: Reserve teammate actions.

@@ -303,6 +303,8 @@ class CombatPlanner:
         """
 
         session = self._entry_session_for(current_char)
+        turn_route = None
+        turn_step = None
 
         while session.steps < self.MAX_ACTIONS_PER_ENTRY:
             if session.steps == 0 and self._should_return_to_requester_before_action(
@@ -316,6 +318,10 @@ class CombatPlanner:
                 break
 
             action, scheduled = self._next_session_action(session)
+            if not scheduled and self._route_waits_for_turn(current_char):
+                # Capture the step after route advancement, before running normal actions.
+                turn_route = self.state.locked_route
+                turn_step = turn_route.current_step()
             if action is None:
                 if session.steps == 0:
                     if self._should_return_to_requester_before_action(
@@ -361,13 +367,24 @@ class CombatPlanner:
         if (
             not session.successful_action
             and not session.yielded_before_action
-            and self._can_use_field_time_fallback()
+            and self._can_use_field_time_fallback(current_char)
         ):
             context = self.context_for(current_char)
             fallback_result = self._perform_field_time_fallback(current_char, context)
             if fallback_result is not None:
                 session.last_result = fallback_result
 
+        if (
+            turn_route is not None
+            and self.state.locked_route is turn_route
+            and turn_route.current_step() is turn_step
+            and not session.yielded_before_action
+            and self._route_waits_for_turn(current_char)
+            and not self.state.expire_locked_route()
+        ):
+            turn_route.complete_turn(current_char)
+            if turn_route.fulfilled():
+                self.state.fulfill_locked_route()
         return session.last_result
 
     def _ensure_followup_sources(
@@ -487,7 +504,7 @@ class CombatPlanner:
         if action is not None and action.identity_key() not in excluded_action_names:
             return action
 
-        skipped_actions = self._skip_unavailable_optional_route_steps(context)
+        skipped_actions = self._advance_ready_route_steps(context)
         if skipped_route_actions is not None:
             skipped_route_actions.extend(skipped_actions)
         if self._should_return_to_requester_before_action(char, context):
@@ -740,16 +757,16 @@ class CombatPlanner:
 
     def _should_continue_entry(self, current_char: "BaseChar", result: ActionResult) -> bool:
         if not result.success:
-            return self._can_try_next_action_after_failure()
+            return self._can_try_next_action_after_failure(current_char)
         if self.state.locked_route is not None:
             return self._locked_route_can_continue_on_current(current_char)
         if any(request_blocks_entry_flow(request) for request in self.state.active_requests):
             return False
         return True
 
-    def _can_try_next_action_after_failure(self) -> bool:
+    def _can_try_next_action_after_failure(self, current_char: "BaseChar") -> bool:
         if self.state.locked_route is not None:
-            return False
+            return self._route_waits_for_turn(current_char)
         if any(request_blocks_entry_flow(request) for request in self.state.active_requests):
             return False
         return True
@@ -761,12 +778,10 @@ class CombatPlanner:
             return True
         return any(request_blocks_entry_flow(request) for request in self.state.active_requests)
 
-    def _can_use_field_time_fallback(self) -> bool:
+    def _can_use_field_time_fallback(self, current_char: "BaseChar") -> bool:
         if self.state.locked_route is not None:
-            return False
-        return not any(
-            request_blocks_entry_flow(request) for request in self.state.active_requests
-        )
+            return self._route_waits_for_turn(current_char)
+        return not any(request_blocks_entry_flow(request) for request in self.state.active_requests)
 
     def _locked_route_can_continue_on_current(self, current_char: "BaseChar") -> bool:
         request = self.state.locked_route
@@ -776,6 +791,13 @@ class CombatPlanner:
         if step is None or step.requires_entry_reaction:
             return False
         return step.matches_char(current_char)
+
+    def _route_waits_for_turn(self, char: "BaseChar") -> bool:
+        request = self.state.locked_route
+        step = request.current_step() if request is not None else None
+        return bool(
+            step is not None and step.switch_step and step.wait_for_turn and step.matches_char(char)
+        )
 
     def _element_reaction_decision(
         self, current_char: "BaseChar", has_intro: bool
@@ -960,13 +982,20 @@ class CombatPlanner:
             return request
         return None
 
-    def _skip_unavailable_optional_route_steps(
+    def _advance_ready_route_steps(
         self,
         context: CombatContext,
     ) -> list[ActionIntent]:
+        """完成已满足的到场步骤, 并跳过不可用的可选动作步骤。"""
+
         skipped_actions: list[ActionIntent] = []
         request = self._strict_route_request(context)
         while request is not None:
+            if self._can_switch_to(context.current_char):
+                context._state.complete_route_arrival_steps(context.current_char)
+                request = self._strict_route_request(context)
+                if request is None:
+                    return skipped_actions
             step = request.current_step()
             if step is None or not step.optional:
                 return skipped_actions
@@ -1034,7 +1063,12 @@ class CombatPlanner:
         if request is None:
             return None
         step = request.current_step()
-        if step is None or step.requires_entry_reaction or not step.matches_char(char):
+        if (
+            step is None
+            or step.switch_step
+            or step.requires_entry_reaction
+            or not step.matches_char(char)
+        ):
             return None
 
         return ActionIntent(
@@ -1059,7 +1093,7 @@ class CombatPlanner:
     def _strict_route_decision(
         self, current_char: "BaseChar", context: CombatContext, has_intro: bool
     ) -> SwitchDecision | None:
-        self._skip_unavailable_optional_route_steps(context)
+        self._advance_ready_route_steps(context)
         request = self._strict_route_request(context)
         if request is None:
             return None
@@ -1078,6 +1112,14 @@ class CombatPlanner:
 
         target = self._strict_route_target(context, step)
         if target is not None:
+            if step.switch_step:
+                return SwitchDecision(
+                    target=target,
+                    reason=f"strict route switch: {request.reason} / {step.reason}",
+                    priority=999999,
+                    has_intro=has_intro,
+                    expected_entry=None,
+                )
             if step.requires_entry_reaction:
                 if not has_intro:
                     return SwitchDecision(

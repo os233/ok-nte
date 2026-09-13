@@ -2182,6 +2182,312 @@ class TestCombatPlanner(unittest.TestCase):
 
         self.assertIsNone(planner.state.locked_route)
 
+    def test_route_switch_completes_on_arrival_and_restores_normal_flow(self):
+        source = FakeChar(0, "source")
+        target = FakeChar(1, "target")
+        planner = self._planner([source, target])
+        self._publish(
+            planner,
+            source,
+            lambda ctx: ctx.request_route(
+                [
+                    FollowupStep.for_switch(target, wait_for_turn=False),
+                ]
+            ),
+        )
+
+        decision = planner.decide_switch(source)
+        self.assertEqual(decision.target, target)
+        self.assertIsNone(decision.expected_entry)
+        self.assertIsNotNone(planner.state.locked_route)
+        planner.record_switch(source)
+        self.assertIsNotNone(planner.state.locked_route)
+        planner.record_switch(target)
+        self.assertIsNone(planner.state.locked_route)
+        result = planner.perform_current_char(target)
+        self.assertEqual(result.name, "target_action")
+        self.assertTrue(result.success)
+
+    def test_route_switch_waits_for_normal_turn_before_next_character(self):
+        calls = []
+        source = FakeChar(0, "source")
+        a = FakeChar(
+            1,
+            "a",
+            plan_items=[
+                ActionIntent(
+                    name="failed", tags=set(), execute=lambda _: calls.append("failed") or False
+                ),
+                ActionIntent(
+                    name="skill", tags=set(), execute=lambda _: calls.append("skill") or True
+                ),
+                ActionIntent(
+                    name="ultimate", tags=set(), execute=lambda _: calls.append("ultimate") or True
+                ),
+            ],
+        )
+        b = FakeChar(2, "b", tags={ActionTag.ULTIMATE_ACTION})
+        planner = self._planner([source, a, b])
+        self._publish(
+            planner,
+            source,
+            lambda ctx: ctx.request_route(
+                [
+                    FollowupStep.for_switch(a),
+                    FollowupStep.for_action(b, ActionSlot.ULTIMATE),
+                ]
+            ),
+        )
+        self.assertEqual(planner.decide_switch(source).target, a)
+        planner.record_switch(a)
+        self.assertEqual(planner.decide_switch(a).target, a)
+        planner.perform_current_char(a)
+        self.assertEqual(calls, ["failed", "skill", "ultimate"])
+        self.assertEqual(planner.decide_switch(a).target, b)
+        self.assertEqual(planner.perform_current_char(b).name, "b_action")
+        self.assertIsNone(planner.state.locked_route)
+
+    def test_route_switch_waits_for_current_character_turn(self):
+        a = FakeChar(0, "a")
+        planner = self._planner([a])
+        self._publish(
+            planner,
+            a,
+            lambda ctx: ctx.request_route(
+                [
+                    FollowupStep.for_switch(a),
+                ]
+            ),
+        )
+        self.assertEqual(planner.decide_switch(a).target, a)
+        self.assertIsNotNone(planner.state.locked_route)
+        self.assertEqual(planner.perform_current_char(a).name, "a_action")
+        self.assertIsNone(planner.state.locked_route)
+
+    def test_route_switch_normal_turn_uses_field_fallback(self):
+        a = FakeChar(0, "a", plan_items=[])
+        planner = self._planner([a])
+        self._publish(
+            planner,
+            a,
+            lambda ctx: ctx.request_route(
+                [
+                    FollowupStep.for_switch(a),
+                ]
+            ),
+        )
+        planner.perform_current_char(a)
+        self.assertGreater(a.waited, 0)
+        self.assertIsNone(planner.state.locked_route)
+
+    def test_route_wait_step_activated_during_turn_completes_without_repeating_turn(self):
+        for prefix_kind in ("arrival", "optional_action"):
+            with self.subTest(prefix=prefix_kind):
+                calls = []
+                a = FakeChar(
+                    0,
+                    "a",
+                    plan_items=[
+                        ActionIntent(
+                            name="normal",
+                            tags=set(),
+                            execute=lambda _: calls.append("a") or True,
+                        )
+                    ],
+                )
+                b = FakeChar(1, "b", tags={ActionTag.ULTIMATE_ACTION})
+                planner = self._planner([a, b])
+                prefix = (
+                    FollowupStep.for_switch(a, wait_for_turn=False)
+                    if prefix_kind == "arrival"
+                    else FollowupStep.for_action(a, ActionSlot.SKILL, optional=True)
+                )
+                self._publish(
+                    planner,
+                    a,
+                    lambda ctx: ctx.request_route(
+                        [
+                            prefix,
+                            FollowupStep.for_switch(a),
+                            FollowupStep.for_action(b, ActionSlot.ULTIMATE),
+                        ]
+                    ),
+                )
+
+                planner.perform_current_char(a)
+
+                self.assertEqual(calls, ["a"])
+                self.assertEqual(planner.decide_switch(a).target, b)
+
+    def test_route_replaced_by_last_normal_action_does_not_complete_new_turn(self):
+        a = FakeChar(
+            0,
+            "a",
+            plan_items=lambda _: [
+                ActionIntent(
+                    name="replace",
+                    tags=set(),
+                    execute=lambda ctx: ctx.request_route([FollowupStep.for_switch(a)]) or True,
+                )
+            ],
+        )
+        planner = self._planner([a])
+        self._publish(
+            planner,
+            a,
+            lambda ctx: ctx.request_route(
+                [
+                    FollowupStep.for_switch(a),
+                ]
+            ),
+        )
+
+        planner.perform_current_char(a)
+
+        self.assertIsNotNone(planner.state.locked_route)
+        self.assertEqual(planner.decide_switch(a).target, a)
+
+    def test_route_switch_expiration_during_turn_does_not_fulfill(self):
+        expired = []
+        handles = []
+        a = FakeChar(
+            0,
+            "a",
+            plan_items=[
+                ActionIntent(
+                    name="expire",
+                    tags=set(),
+                    execute=lambda _: expired.append(True) or True,
+                )
+            ],
+        )
+        planner = self._planner([a])
+        self._publish(
+            planner,
+            a,
+            lambda ctx: handles.append(
+                ctx.request_route(
+                    [FollowupStep.for_switch(a)],
+                    until=lambda: bool(expired),
+                )
+            ),
+        )
+        planner.perform_current_char(a)
+        self.assertEqual(handles[0].status, Planner.RequestStatus.EXPIRED)
+        self.assertIsNone(planner.state.locked_route)
+
+    def test_turn_end_does_not_expire_unrelated_switch_request(self):
+        for wait_route in (False, True):
+            with self.subTest(wait_route=wait_route):
+                expired = []
+                finished = []
+                handles = []
+                a = FakeChar(
+                    0,
+                    "a",
+                    plan_items=[
+                        ActionIntent(
+                            name="close_window",
+                            tags=set(),
+                            execute=lambda _: expired.append(True) or True,
+                        )
+                    ],
+                )
+                b = FakeChar(1, "b")
+                planner = self._planner([a, b])
+                self._publish(
+                    planner,
+                    a,
+                    lambda ctx: handles.append(
+                        ctx.request_switch(
+                            b,
+                            until=lambda: bool(expired),
+                            on_finish=lambda: finished.append(True),
+                        )
+                    ),
+                )
+                if wait_route:
+                    self._publish(
+                        planner,
+                        a,
+                        lambda ctx: ctx.request_route(
+                            [
+                                FollowupStep.for_switch(a),
+                            ]
+                        ),
+                    )
+
+                planner.perform_current_char(a)
+
+                self.assertEqual(finished, [])
+                self.assertFalse(handles[0].is_expired)
+                self.assertIsNone(planner.state.locked_route)
+                planner.context_for(a)
+                self.assertTrue(handles[0].is_expired)
+                self.assertEqual(finished, [True])
+
+    def test_route_switch_advances_to_next_action_without_target_turn(self):
+        source = FakeChar(0, "source")
+        a = FakeChar(1, "a")
+        b = FakeChar(2, "b", tags={ActionTag.ULTIMATE_ACTION})
+        planner = self._planner([source, a, b])
+        self._publish(
+            planner,
+            source,
+            lambda ctx: ctx.request_route(
+                [
+                    FollowupStep.for_switch(a, wait_for_turn=False),
+                    FollowupStep.for_action(b, ActionSlot.ULTIMATE),
+                ]
+            ),
+        )
+
+        self.assertEqual(planner.decide_switch(source).target, a)
+        planner.record_switch(a)
+        decision = planner.decide_switch(a)
+        self.assertEqual(decision.target, b)
+        self.assertEqual(decision.expected_entry.slot, ActionSlot.ULTIMATE)
+
+    def test_route_switch_already_current_restores_normal_flow(self):
+        target = FakeChar(0, "target")
+        planner = self._planner([target])
+        self._publish(
+            planner,
+            target,
+            lambda ctx: ctx.request_route(
+                [
+                    FollowupStep.for_switch(target, wait_for_turn=False),
+                    FollowupStep.for_switch(target, wait_for_turn=False),
+                ]
+            ),
+        )
+
+        result = planner.perform_current_char(target)
+        self.assertEqual(result.name, "target_action")
+        self.assertIsNone(planner.state.locked_route)
+
+    def test_route_switch_dead_target_expires(self):
+        source = FakeChar(0, "source")
+        target = FakeChar(1, "target")
+        planner = self._planner([source, target])
+        handles = []
+        self._publish(
+            planner,
+            source,
+            lambda ctx: handles.append(
+                ctx.request_route(
+                    [
+                        FollowupStep.for_switch(target, wait_for_turn=False),
+                    ]
+                )
+            ),
+        )
+        target.is_dead = True
+
+        self.assertEqual(planner.decide_switch(source).target, source)
+        self.assertIsNone(planner.state.locked_route)
+        self.assertEqual(handles[0].status, Planner.RequestStatus.EXPIRED)
+
     def test_request_switch_prefers_target_without_expected_action(self):
         source = FakeChar(0, "source")
         zero = FakeChar(1, "zero")

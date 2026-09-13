@@ -91,7 +91,7 @@ msgid "刷新列表"
 msgstr "Atualizar Lista"
 
 msgid "匹配成功: {}"
-msgstr "Correspondência bem-sucedida: {}"
+msgstr "Detectado: {}"
 
 msgid "置信度: {:.2f}"
 msgstr "Confiança: {:.2f}"
@@ -184,7 +184,7 @@ msgid "未启用"
 msgstr "Desativado"
 
 msgid "未能识别该特征"
-msgstr "Não foi possível identificar esta característica"
+msgstr "Não reconhecido"
 
 msgid "未获取到特征"
 msgstr "Característica não obtida"
@@ -1169,3 +1169,6 @@ msgstr "Selecione uma predefinição"
 
 msgid "队伍配置"
 msgstr "Configuração da equipe"
+
+msgid "不是该角色?"
+msgstr "Não é este personagem?"

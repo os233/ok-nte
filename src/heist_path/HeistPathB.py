@@ -25,17 +25,17 @@ class HeistPathB(HeistPathA):
         self.lg1_wp3()
         if idx == -1:
             self.lg1_wp4()
-            self.lg1_wp5_avoid_combat_01()
+            self.lg1_wp5_avoid_combat_00()
         elif idx == 0:
             self.lg1_wp4_buster()
             self.lg1_wp5_buster()
         elif idx == 1:
             self.lg1_wp4()
-            self.lg1_wp5_avoid_combat_03()
+            self.lg1_wp5_avoid_combat_02()
         self.wait_team_ui_settle()
         # if not self.check_current_floor_str("藏品"):
         #     self.check_current_floor(2)
-        self.lg2_wp1_to_exit1() # self.lg2_wp1_to_exit1_safer(False)
+        self.lg2_wp1_to_exit1()  # self.lg2_wp1_to_exit1_safer(False)
         self.lg2_wp1_remains()
         self.lg2_wp2_to_exit2_safer()
         self.lg2_wp3_to_layzer_room()
@@ -169,7 +169,9 @@ class HeistPathB(HeistPathA):
         self.wait_and_interact(direction="d", is_lock=True, time_out=7.64)
         self.sleep(0.10)
         self.send_key_up("w")
-        if self.wait_ocr(x=0.60, y=0.52, to_x=0.70, to_y=0.57, match=re.compile("开门"), time_out=1.14):
+        if self.wait_ocr(
+            x=0.60, y=0.52, to_x=0.70, to_y=0.57, match=re.compile("开门"), time_out=1.14
+        ):
             self.sleep(0.10)
             self.send_key("f", down_time=0.10)
             self.sleep(0.10)
@@ -179,14 +181,15 @@ class HeistPathB(HeistPathA):
             self.sleep(0.10)
             self.send_key("w", down_time=0.32)
             self.sleep(0.10)
-            self.send_key_down('d')
+            self.send_key_down("d")
             self.sleep(0.05)
             self.wait_and_interact(direction="d", is_lock=False, time_out=3.65)
             if self.find_interac():
                 is_open_door = self.lobby_open_door_check()
                 if not is_open_door:
                     from src.tasks.AutoHeistTask import AbortException
-                    raise AbortException("timeout for wait_and_interact") # 考虑之后加复位或其他
+
+                    raise AbortException("timeout for wait_and_interact")  # 考虑之后加复位或其他
                 else:
                     self.sleep(0.10)
                     self.send_key("f", down_time=0.10)
@@ -203,23 +206,23 @@ class HeistPathB(HeistPathA):
         self.sleep(0.30)
         self.switch_to_avoider(check_switched=True)
         self.sleep(0.10)
-        self.send_key_down('w')
+        self.send_key_down("w")
         self.sleep(0.64)
-        self.send_key('lshift', down_time=0.24)
+        self.send_key("lshift", down_time=0.24)
         self.sleep(0.64)
-        self.send_key('lshift', down_time=0.24)
+        self.send_key("lshift", down_time=0.24)
         self.sleep(0.64)
-        self.send_key('lshift', down_time=0.24)
+        self.send_key("lshift", down_time=0.24)
         self.sleep(0.64)
-        self.send_key_up('w')
+        self.send_key_up("w")
         self.sleep(0.10)
-        self.send_key_down('d')
+        self.send_key_down("d")
         self.sleep(0.64)
-        self.send_key('lshift', down_time=0.24)
+        self.send_key("lshift", down_time=0.24)
         self.sleep(0.64)
-        self.send_key_up('d')
+        self.send_key_up("d")
         self.sleep(0.10)
-        self.send_key_down('w')
+        self.send_key_down("w")
         self.sleep(0.24)
         self.send_key("lshift", down_time=0.24)
         self.sleep(0.60)
@@ -233,25 +236,25 @@ class HeistPathB(HeistPathA):
         self.sleep(0.24)
         self.send_key_up("d")
         self.sleep(0.24)
-        self.send_key('space', down_time=0.24)
+        self.send_key("space", down_time=0.24)
         self.sleep(0.64)
-        self.send_key('space', down_time=0.24)
+        self.send_key("space", down_time=0.24)
         self.sleep(0.64)
-        self.send_key('space', down_time=0.24)
+        self.send_key("space", down_time=0.24)
         self.sleep(0.64)
-        self.send_key('space', down_time=0.24)
+        self.send_key("space", down_time=0.24)
         self.sleep(0.64)
-        self.send_key('space', down_time=0.24)
+        self.send_key("space", down_time=0.24)
         self.sleep(0.64)
-        self.send_key('space', down_time=0.24)
+        self.send_key("space", down_time=0.24)
         self.sleep(0.64)
-        self.send_key('space', down_time=0.24)
+        self.send_key("space", down_time=0.24)
         self.sleep(0.64)
-        self.send_key('space', down_time=0.24)
+        self.send_key("space", down_time=0.24)
         self.sleep(0.64)
-        self.send_key('space', down_time=0.24)
+        self.send_key("space", down_time=0.24)
         self.sleep(0.84)
-        self.send_key('lshift', down_time=0.24)
+        self.send_key("lshift", down_time=0.24)
         self.sleep(0.84)
         self.send_key_up("w")
         self.sleep(0.10)
@@ -269,11 +272,11 @@ class HeistPathB(HeistPathA):
         self.sleep(0.10)
         self.send_key_down("a")
         self.sleep(0.20)
-        self.send_key('lshift', down_time=0.20)
+        self.send_key("lshift", down_time=0.20)
         self.sleep(0.20)
-        self.send_key('lshift', down_time=0.20)
+        self.send_key("lshift", down_time=0.20)
         self.sleep(0.20)
-        self.send_key('lshift', down_time=0.20)
+        self.send_key("lshift", down_time=0.20)
         self.sleep(1.20)
         self.send_key_up("a")
         self.sleep(0.10)
@@ -303,25 +306,25 @@ class HeistPathB(HeistPathA):
         self.sleep(0.10)
         self.click(down_time=0.64)
         self.sleep(0.10)
-        self.send_key_down('w')
+        self.send_key_down("w")
         self.sleep(1.14)
-        self.send_key('lshift', down_time=0.24)
+        self.send_key("lshift", down_time=0.24)
         self.sleep(0.42)
-        self.send_key('lshift', down_time=0.24)
+        self.send_key("lshift", down_time=0.24)
         self.sleep(0.42)
-        self.send_key('lshift', down_time=0.24)
+        self.send_key("lshift", down_time=0.24)
         self.sleep(0.42)
         self.send_key_down("d")
         self.sleep(0.42)
-        self.send_key_up('d')
+        self.send_key_up("d")
         self.sleep(0.42)
-        self.send_key('lshift', down_time=0.24)
+        self.send_key("lshift", down_time=0.24)
         self.sleep(0.76)
-        self.send_key_up('w')
+        self.send_key_up("w")
         self.sleep(0.10)
         self.click(down_time=0.64)
         self.sleep(0.10)
-        self.send_key_down('w')
+        self.send_key_down("w")
         self.wait_and_interact(direction="w", is_lock=True, time_out=7.64)
         self.sleep(0.10)
         self.send_key_down("w")
@@ -330,11 +333,13 @@ class HeistPathB(HeistPathA):
         self.wait_and_interact(direction="w", is_lock=False, time_out=3.65)
         self.sleep(0.30)
 
-    def lobby_open_door_check(self, check_time = 3):
+    def lobby_open_door_check(self, check_time=3):
         open_door = False
-        open_loop =0
+        open_loop = 0
         while not open_door and open_loop < check_time:
-            if self.wait_ocr(x=0.60, y=0.52, to_x=0.70, to_y=0.57, match=re.compile("开门"), time_out=1.14):
+            if self.wait_ocr(
+                x=0.60, y=0.52, to_x=0.70, to_y=0.57, match=re.compile("开门"), time_out=1.14
+            ):
                 open_door = True
             else:
                 self.sleep(0.10)
@@ -346,17 +351,17 @@ class HeistPathB(HeistPathA):
     # LG1部分优化
     def lg1_wp1_safer(self):
         self.log_round_info("LG1 WP1 Safer")
-        self.switch_to_runner(check_switched=True) # 确认切到薄荷跑图
+        self.switch_to_runner(check_switched=True)  # 确认切到薄荷跑图
         self.sleep(0.20)
-        self.send_key('w', down_time=9.08)
+        self.send_key("w", down_time=9.08)
         self.sleep(0.10)
-        self.send_key('d', down_time=1.72)
+        self.send_key("d", down_time=1.72)
         self.sleep(0.10)
-        self.send_key('s', down_time=1.00)
+        self.send_key("s", down_time=1.00)
         self.sleep(0.10)
-        self.send_key('f', down_time=0.10) # 这里没必要上检测，门口不安全，停太久可能会被蚊子扫
+        self.send_key("f", down_time=0.10)  # 这里没必要上检测，门口不安全，停太久可能会被蚊子扫
         self.sleep(0.10)
-        self.send_key('f', down_time=0.10)
+        self.send_key("f", down_time=0.10)
         self.sleep(0.20)
         self.send_key_down("f")  # start pick
         self.sleep(0.11)
@@ -532,15 +537,15 @@ class HeistPathB(HeistPathA):
         self.send_key_up("d")
         self.sleep(0.20)
         self.send_key_up("f")  # end pick
-        self.send_key_down('w')
+        self.send_key_down("w")
         self.sleep(1.70)
-        self.send_key_up('w')
+        self.send_key_up("w")
         self.sleep(0.11)
-        self.send_key_down('d')
+        self.send_key_down("d")
         self.sleep(0.80)
         self.send_key("lshift", down_time=0.10)
         self.sleep(2.00)
-        self.send_key_up('d')
+        self.send_key_up("d")
         self.sleep(0.11)
         self.send_key_down("s")
         self.sleep(0.31)
@@ -582,12 +587,12 @@ class HeistPathB(HeistPathA):
         self.send_key_down("w")
         self.sleep(0.75)  # 4.03
         self.send_key_up("w")
-       # self.switch_to_runner()
-       # self.sleep(0.11)
-       # self.send_key_down("s")
-       # self.sleep(2.75)
-       # self.send_key_up("s")
-       # self.switch_to_runner()
+        # self.switch_to_runner()
+        # self.sleep(0.11)
+        # self.send_key_down("s")
+        # self.sleep(2.75)
+        # self.send_key_up("s")
+        # self.switch_to_runner()
         self.sleep(0.11)
         self.send_key_down("d")
         self.sleep(1.51)
@@ -615,10 +620,10 @@ class HeistPathB(HeistPathA):
         ret = self.wait_ocr(0.04, 0.23, 0.17, 0.28, match=re.compile(floor_str), time_out=5)
         if ret:
             return True
-    
+
     # 定制化战斗切人方法
     def switch_to_fighter(self, check_switched=False, mode="all_desc"):
-        """切换到可用战斗角色。   
+        """切换到可用战斗角色。
         `mode` 调度策略（配置重新从小到大排序后）：
         - "all_desc": [默认]按键位从大到小完整尝试（如 ["4", "1"]）
         - "all_asc" : 按键位从小到大完整尝试（如 ["1", "4"]）
@@ -636,7 +641,7 @@ class HeistPathB(HeistPathA):
             keys = sorted_keys
         elif mode == "all_desc":
             keys = sorted_keys[::-1]
-        elif isinstance(mode, int):   
+        elif isinstance(mode, int):
             if mode == -1:
                 keys = [sorted_keys[-1]]
             else:
@@ -644,7 +649,10 @@ class HeistPathB(HeistPathA):
                 if 0 <= idx < len(sorted_keys):
                     keys = [sorted_keys[idx]]
                 else:
-                    self.log_error(f"切人位置越界！配置排序后只有 {len(sorted_keys)} 个人，你请求切第 {mode} 个，自动切最后一个。")
+                    self.log_error(
+                        f"切人位置越界！配置排序后只有 {len(sorted_keys)} 个人，"
+                        f"你请求切第 {mode} 个，自动切最后一个。"
+                    )
                     keys = [sorted_keys[-1]]
         else:
             keys = sorted_keys[::-1]

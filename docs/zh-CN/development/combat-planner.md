@@ -326,6 +326,29 @@ def combat_plan(self, context):
 常用 API：
 
 - `context.request_route(...)`：固定顺序协作路线。
+
+`FollowupStep.for_switch(target, wait_for_turn=True)` 默认切入后等待目标正常执行完本轮:
+
+```python
+context.request_route([
+    FollowupStep.for_switch(a),
+    FollowupStep.for_action(b, ActionSlot.ULTIMATE),
+])
+```
+
+这里 A 按自己的正常 entry flow 执行完本轮后, 才推进到 B 的终结技。
+A 已在场时也会执行本轮, 不直接跳过。它不指定首动, 不要求入场反应,
+也不绕过动作许可或 reservation。本轮结束沿用正常流程的结束条件和动作数上限;
+无动作或全部失败时仍可尝试正常站场回退, 不要求某个技能成功才完成步骤。
+异常中断不会算作完成; route 过期或被替换后不会再推进旧步骤。
+
+若只要求切入, 使用 `FollowupStep.for_switch(a, wait_for_turn=False)`。
+该模式切入成功或目标已在场时立即完成步骤。单步 route 结束后恢复正常流程;
+多步 route 会立即推进, **不等待 A 正常流程结束, 也不保证 A 执行任何动作**。
+
+两种模式均继承 strict route 的调度优先级和生命周期。新 route 会替换已有 route,
+因此它不是单纯的高优先级 `request_switch()`; 普通独立切人诉求仍使用后者。
+
 - `context.request_switch(...)`：请求下一次普通调度切给某角色。
 - `context.request_role(...)`：请求下一次普通调度切给某个队伍定位的角色；多个
   匹配角色时按普通切人评分选择。它不指定动作，也不打断当前 entry flow。

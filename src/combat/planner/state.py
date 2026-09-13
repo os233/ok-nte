@@ -65,16 +65,7 @@ class CombatState:
         """清理过期请求，并处理 strict route 的过期锁定行为。"""
 
         now = time.time()
-        if self.locked_route is not None and self.locked_route.expired(now):
-            step = self.locked_route.current_step()
-            step_reason = step.reason if step is not None else "route completed"
-            logger.warning(
-                f"strict route deadline expired, route unlocked: "
-                f"{self.locked_route.reason} / {step_reason}"
-            )
-            self.locked_route.finish(RequestStatus.EXPIRED)
-            self.locked_route.close()
-            self.locked_route = None
+        self.expire_locked_route(now)
         active_requests = []
         for request in self.active_requests:
             if request.expired(now):
@@ -91,6 +82,24 @@ class CombatState:
                 continue
             lifecycle_requests.append(request)
         self.lifecycle_requests = lifecycle_requests
+
+    def expire_locked_route(self, now: float | None = None) -> bool:
+        """仅检查当前 route 的过期条件, 返回是否已按过期规则结束。"""
+
+        if now is None:
+            now = time.time()
+        if self.locked_route is not None and self.locked_route.expired(now):
+            step = self.locked_route.current_step()
+            step_reason = step.reason if step is not None else "route completed"
+            logger.warning(
+                f"strict route deadline expired, route unlocked: "
+                f"{self.locked_route.reason} / {step_reason}"
+            )
+            self.locked_route.finish(RequestStatus.EXPIRED)
+            self.locked_route.close()
+            self.locked_route = None
+            return True
+        return False
 
     def add_requests(self, requests: Iterable[_Request]) -> None:
         """加入角色新发布的协作请求。"""
@@ -169,6 +178,16 @@ class CombatState:
                 continue
             active_requests.append(request)
         self.active_requests = active_requests
+        self.complete_route_arrival_steps(target_char)
+
+    def complete_route_arrival_steps(self, target_char: "BaseChar") -> None:
+        """完成目标已在场的纯切人步骤, 包括连续指向同一角色的步骤。"""
+
+        while self.locked_route is not None:
+            if not self.locked_route.complete_switch(target_char):
+                return
+            if self.locked_route.fulfilled():
+                self.fulfill_locked_route()
 
     def fulfill_locked_route(self) -> None:
         """完成当前 strict route，并按配置清除或转为返回发起者请求。"""

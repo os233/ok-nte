@@ -21,6 +21,7 @@ from qfluentwidgets import (
     CommandBar,
     FluentIcon,
     Flyout,
+    HyperlinkButton,
     IconWidget,
     ImageLabel,
     InfoBar,
@@ -33,6 +34,7 @@ from qfluentwidgets import (
     StrongBodyLabel,
     SubtitleLabel,
     TransparentToolButton,
+    setFont,
 )
 
 from src.char.custom.CustomCharManager import CustomCharManager
@@ -247,6 +249,7 @@ class SlotCard(BorderCardWidget):
         self.tr_action_btn = og.app.tr("关联特征")
         self.tr_add_match_feature_btn = og.app.tr("加入特征")
         self.tr_feature_added_btn = og.app.tr("特征已加入")
+        self.tr_not_this_char = og.app.tr("不是该角色?")
         self.tr_confidence = og.app.tr("置信度: {:.2f}")
         self.setFixedHeight(168)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -256,12 +259,19 @@ class SlotCard(BorderCardWidget):
         root_layout.setSpacing(8)
 
         # Header with slot badge
-        header_row = QHBoxLayout()
+        header_widget = QWidget(self)
+        header_widget.setFixedHeight(24)
+        header_row = QHBoxLayout(header_widget)
         header_row.setContentsMargins(0, 0, 0, 0)
-        self.slot_badge = StrongBodyLabel(self.tr_slot_title.format(index + 1), self)
-        header_row.addWidget(self.slot_badge)
+        self.slot_badge = StrongBodyLabel(self.tr_slot_title.format(index + 1), header_widget)
+        header_row.addWidget(self.slot_badge, alignment=Qt.AlignmentFlag.AlignVCenter)
         header_row.addStretch(1)
-        root_layout.addLayout(header_row)
+        self.btn_relink = HyperlinkButton(header_widget)
+        self.btn_relink.setText(self.tr_not_this_char)
+        setFont(self.btn_relink, 12)
+        self.btn_relink.hide()
+        header_row.addWidget(self.btn_relink, alignment=Qt.AlignmentFlag.AlignVCenter)
+        root_layout.addWidget(header_widget)
 
         self.stack = QStackedLayout()
 
@@ -314,6 +324,7 @@ class SlotCard(BorderCardWidget):
         root_layout.addLayout(self.stack, 1)
 
         self.btn_act.clicked.connect(self.on_action)
+        self.btn_relink.clicked.connect(self.on_relink)
         self.current_mat = None
         self.current_w = 0
         self.current_h = 0
@@ -330,6 +341,7 @@ class SlotCard(BorderCardWidget):
         self.status.setText(text)
         self.empty_status.setText(text)
         self.stack.setCurrentWidget(self.empty_widget)
+        self.btn_relink.hide()
 
     def show_result(self):
         self.stack.setCurrentWidget(self.result_widget)
@@ -368,15 +380,18 @@ class SlotCard(BorderCardWidget):
                 self.btn_act.setEnabled(True)
             self.btn_act.setText(self.tr_add_match_feature_btn)
             self.btn_act.show()
+            self.btn_relink.show()
         elif mat is not None:
             self.status.setText(self._status_text(self.tr_unrecognized, confidence))
             self.btn_act.setEnabled(True)
             self.btn_act.setText(self.tr_action_btn)
             self.btn_act.show()
+            self.btn_relink.hide()
         else:
             self.show_empty(self.tr_no_image)
             self.btn_act.setEnabled(True)
             self.btn_act.hide()
+            self.btn_relink.hide()
 
     def on_action(self):
         if self.current_match_char_id and self.current_mat is not None:
@@ -395,8 +410,14 @@ class SlotCard(BorderCardWidget):
             )
             self.btn_act.setText(self.tr_feature_added_btn)
             self.btn_act.setEnabled(False)
+            self.btn_relink.hide()
             return
 
+        self.on_relink()
+
+    def on_relink(self):
+        if self.current_mat is None:
+            return
         dialog = NewCharDialog(self.current_mat, self.manager, self.window())
         if dialog.exec():
             char_id = save_character_from_dialog(self.manager, dialog)
@@ -414,6 +435,9 @@ class SlotCard(BorderCardWidget):
                     char_id,
                     1.0,
                 )
+                self.btn_act.setText(self.tr_feature_added_btn)
+                self.btn_act.setEnabled(False)
+                self.btn_relink.hide()
 
 
 class PresetSlotRow(QWidget):

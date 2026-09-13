@@ -624,6 +624,7 @@ class CombatPlan:
         self.actions = list(self.actions)
         self.claims = list(self.claims)
 
+
 def _display_result_name(result: ActionResult) -> str:
     if result.name:
         return result.name
@@ -646,6 +647,25 @@ class FollowupStep:
     target_names: set[str] = field(default_factory=set)
     requires_entry_reaction: bool = False
     optional: bool = False
+
+    switch_step: bool = False
+    wait_for_turn: bool = False
+
+    @classmethod
+    def for_switch(
+        cls, target: "BaseChar", reason: str = "", *, wait_for_turn: bool = True
+    ) -> "FollowupStep":
+        """切入后默认等待目标正常执行完本轮, 再推进 route。
+
+        wait_for_turn=False 时切入即完成, 不保证目标执行任何动作。
+        """
+
+        return cls(
+            reason=reason or f"{target} switch followup",
+            target_indices={target.index},
+            switch_step=True,
+            wait_for_turn=wait_for_turn,
+        )
 
     @classmethod
     def for_action(
@@ -697,7 +717,7 @@ class FollowupStep:
     def wants(self, char: "BaseChar", action: ActionIntent | ActionResult) -> bool:
         """判断某角色动作是否满足此步骤。"""
 
-        if self.requires_entry_reaction:
+        if self.switch_step or self.requires_entry_reaction:
             return False
         if not self.matches_char(char):
             return False

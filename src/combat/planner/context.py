@@ -165,7 +165,8 @@ class CombatContext:
         其他动作；窗口保留请单独搭配 `reserve_actions()`。
 
         Args:
-            steps: 路线步骤。每个 `FollowupStep` 描述目标角色和目标动作/入场反应。
+            steps: 路线步骤。支持指定动作、入场反应或 `for_switch()` 纯切人。
+                切人步骤默认等待目标正常执行完本轮; wait_for_turn=False 时切入即完成。
                 为空时不会发布请求，并返回 None。
             reason: 日志和调试用理由；为空时会自动使用当前角色生成默认理由。
             until: 过期条件。为 None 时不会因时间/机制条件过期；传 callable 时，

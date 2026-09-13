@@ -85,7 +85,7 @@ msgid "刷新列表"
 msgstr "Refresh List"
 
 msgid "匹配成功: {}"
-msgstr "Match successful: {}"
+msgstr "Detected: {}"
 
 msgid "置信度: {:.2f}"
 msgstr "Confidence: {:.2f}"
@@ -172,7 +172,7 @@ msgid "未启用"
 msgstr "Disabled"
 
 msgid "未能识别该特征"
-msgstr "Failed to identify this feature"
+msgstr "Unrecognized"
 
 msgid "未获取到特征"
 msgstr "Feature not obtained"
@@ -1437,3 +1437,6 @@ msgstr "Select a preset"
 
 msgid "队伍配置"
 msgstr "Team configuration"
+
+msgid "不是该角色?"
+msgstr "Wrong character?"

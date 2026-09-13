@@ -1,5 +1,7 @@
 """Serializable models shared by workshop archives, catalogs, and UI code."""
 
+import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 PACKAGE_FORMAT_VERSION = 1
@@ -13,6 +15,16 @@ MAX_DISPLAY_NAME_LENGTH = 100
 
 class WorkshopFormatError(ValueError):
     """Raised when workshop metadata cannot be trusted or understood."""
+
+
+def parse_version(value: str) -> tuple[int, int, int]:
+    """Validate a canonical major.minor.patch version and return its numeric order."""
+    if len(value) > MAX_PACKAGE_VERSION_LENGTH or not re.fullmatch(
+        r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", value
+    ):
+        raise WorkshopFormatError("version must use major.minor.patch, for example 1.0.0")
+    major, minor, patch = value.split(".")
+    return int(major), int(minor), int(patch)
 
 
 def _required_text(value, field: str, max_length: int | None = None) -> str:
@@ -101,6 +113,10 @@ class TeamPackage:
     version: str
     slots: tuple[PackageSlot, ...]
 
+    @property
+    def identity(self) -> tuple[str, str]:
+        return self.author, self.name
+
     def to_dict(self) -> dict:
         return {
             "format_version": PACKAGE_FORMAT_VERSION,
@@ -136,11 +152,13 @@ class TeamPackage:
             raise WorkshopFormatError(
                 f"description must not exceed {MAX_PACKAGE_DESCRIPTION_LENGTH} characters"
             )
+        version = _required_text(data.get("version"), "version", MAX_PACKAGE_VERSION_LENGTH)
+        parse_version(version)
         return cls(
             name=_required_text(data.get("name"), "name", MAX_PACKAGE_NAME_LENGTH),
             description=description,
             author=_required_text(data.get("author"), "author", MAX_PACKAGE_AUTHOR_LENGTH),
-            version=_required_text(data.get("version"), "version", MAX_PACKAGE_VERSION_LENGTH),
+            version=version,
             slots=slots,
         )
 
@@ -183,7 +201,24 @@ def parse_catalog(data: object) -> list[CatalogEntry]:
     packages = data.get("packages")
     if not isinstance(packages, list):
         raise WorkshopFormatError("catalog packages must be a list")
-    return sort_catalog_entries(CatalogEntry.from_dict(item) for item in packages)
+    entries = [CatalogEntry.from_dict(item) for item in packages]
+    identities = {(entry.package.identity, entry.package.version) for entry in entries}
+    if len(identities) != len(entries):
+        raise WorkshopFormatError("duplicate author, package name, and version")
+    return sort_catalog_entries(entries)
+
+
+def group_catalog_entries(
+    entries: Iterable[CatalogEntry],
+) -> dict[tuple[str, str], tuple[CatalogEntry, ...]]:
+    """Group a catalog by author and name, keeping every version in descending order."""
+    groups: dict[tuple[str, str], list[CatalogEntry]] = {}
+    for entry in entries:
+        groups.setdefault(entry.package.identity, []).append(entry)
+    return {
+        identity: tuple(sorted(versions, key=lambda e: parse_version(e.package.version), reverse=True))
+        for identity, versions in groups.items()
+    }
 
 
 def sort_catalog_entries(entries) -> list[CatalogEntry]:

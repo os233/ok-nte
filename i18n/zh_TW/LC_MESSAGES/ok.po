@@ -1437,3 +1437,6 @@ msgstr "選擇一個方案"
 
 msgid "队伍配置"
 msgstr "隊伍配置"
+
+msgid "不是该角色?"
+msgstr "不是該角色?"

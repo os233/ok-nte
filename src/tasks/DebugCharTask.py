@@ -84,7 +84,7 @@ class DebugCharTask(NTEOneTimeTask, BaseCombatTask):
             raise
         except Exception as error:
             self.result_error = str(error).strip() or error.__class__.__name__
-            logger.exception("Character tool failed: %s", self.result_error)
+            logger.error("Character tool failed", error)
         finally:
             self.mode = None
 
@@ -110,7 +110,7 @@ class DebugCharTask(NTEOneTimeTask, BaseCombatTask):
             self.scan_results = tuple(results)
         except Exception as error:
             self.result_error = str(error).strip() or error.__class__.__name__
-            logger.exception("Team scan failed: %s", self.result_error)
+            logger.error("Team scan failed", error)
 
     def _test_combo(self) -> None:
         from src.char.custom.CustomChar import CustomChar

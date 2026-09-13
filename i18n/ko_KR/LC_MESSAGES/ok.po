@@ -1437,3 +1437,6 @@ msgstr "프리셋 선택"
 
 msgid "队伍配置"
 msgstr "팀 구성"
+
+msgid "不是该角色?"
+msgstr "다른 캐릭터인가요?"

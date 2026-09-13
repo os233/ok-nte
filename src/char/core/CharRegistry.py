@@ -1,7 +1,8 @@
 from dataclasses import dataclass
 from hashlib import sha256
-from importlib import import_module
-from importlib.util import module_from_spec, spec_from_file_location
+from importlib import import_module, invalidate_caches
+from importlib.machinery import ModuleSpec
+from importlib.util import cache_from_source, module_from_spec, spec_from_file_location
 from pathlib import Path
 from sys import modules
 from threading import RLock
@@ -25,7 +26,9 @@ class CharImplementation:
 
     def display_name(self, locale_name: str = "") -> str:
         char_name = self.cn_name if locale_name == "zh_CN" else self.en_name
-        return f"{self.external_folder_name} - {char_name}" if self.external_folder_name else char_name
+        return (
+            f"{self.external_folder_name} - {char_name}" if self.external_folder_name else char_name
+        )
 
 
 class CharRegistry:
@@ -37,6 +40,7 @@ class CharRegistry:
         self._builtin_scanned = False
         self._external_scanned = False
         self._external_dir = external_dir
+        self._external_packages: dict[str, Path] = {}
 
     @staticmethod
     def _builtin_dir() -> Path:
@@ -74,14 +78,41 @@ class CharRegistry:
                 self._scan_external()
 
     def _scan_external(self) -> None:
+        for name in tuple(modules):
+            if name.partition(".")[0] in self._external_packages:
+                modules.pop(name, None)
+        self._external_packages.clear()
+        invalidate_caches()
         try:
             external_paths = self._get_external_paths()
+            # Clear source caches before any import, including later method-local imports.
+            for source in self._get_external_dir().rglob("*.py"):
+                Path(cache_from_source(str(source))).unlink(missing_ok=True)
         except OSError as error:
             logger.warning(f"Failed to scan external character modules: {error.__class__.__name__}")
             external_paths = []
         for path in external_paths:
+            package_name = self._external_package_name(path.parent)
+            if package_name not in self._external_packages:
+                spec = ModuleSpec(package_name, loader=None, is_package=True)
+                spec.submodule_search_locations = [str(path.parent.resolve())]
+                modules[package_name] = module_from_spec(spec)
+                self._external_packages[package_name] = path.parent.resolve()
+        for path in external_paths:
             self._register_external_module(path)
         self._external_scanned = True
+
+    @staticmethod
+    def _external_package_name(directory: Path) -> str:
+        suffix = sha256(str(directory.resolve()).casefold().encode("utf-8")).hexdigest()[:16]
+        return f"ok_nte_external_{suffix}"
+
+    @classmethod
+    def _external_module_name(cls, path: Path) -> str:
+        stem = (
+            path.stem if path.stem.isidentifier() else sha256(path.name.encode("utf-8")).hexdigest()
+        )
+        return f"{cls._external_package_name(path.parent)}.{stem}"
 
     def _get_external_paths(self) -> list[Path]:
         external_dir = self._get_external_dir()
@@ -147,15 +178,18 @@ class CharRegistry:
         external_dir = self._get_external_dir()
         relative_path = path.relative_to(external_dir)
         relative_stem = relative_path.with_suffix("").as_posix()
-        module_suffix = sha256(relative_stem.encode("utf-8")).hexdigest()[:16]
-        module_name = f"ok_nte_external_{module_suffix}"
+        module_name = self._external_module_name(path)
         try:
-            spec = spec_from_file_location(module_name, path)
-            if spec is None or spec.loader is None:
-                raise ImportError("no module loader")
-            module = module_from_spec(spec)
-            modules[module_name] = module
-            spec.loader.exec_module(module)
+            if path.stem.isidentifier():
+                module = import_module(module_name)
+            else:
+                # Keep existing character filenames that cannot be imported as identifiers.
+                spec = spec_from_file_location(module_name, path)
+                if spec is None or spec.loader is None:
+                    raise ImportError("no module loader")
+                module = module_from_spec(spec)
+                modules[module_name] = module
+                spec.loader.exec_module(module)
         except Exception as error:
             modules.pop(module_name, None)
             logger.warning(
@@ -190,7 +224,9 @@ class CharRegistry:
             en_name=char_cls.en_name,
             cn_name=char_cls.cn_name,
             element=char_cls.element,
-            external_folder_name=relative_path.parent.name if relative_path.parent != Path(".") else "",
+            external_folder_name=relative_path.parent.name
+            if relative_path.parent != Path(".")
+            else "",
         )
 
 

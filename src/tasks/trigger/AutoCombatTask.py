@@ -36,6 +36,6 @@ class AutoCombatTask(BaseCombatTask, TriggerTask):
             while self.in_combat():
                 self.get_current_char(raise_exception=True).perform()
         except NotInCombatException as e:
-            logger.info(f"Out ofcombat {int(time.time() - self.combat_session.combat_start)} {e}")
+            logger.info(f"Out of combat {int(time.time() - self.combat_session.combat_start)} {e}")
         finally:
             self.combat_end()

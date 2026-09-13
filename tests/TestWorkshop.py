@@ -6,6 +6,7 @@ import stat
 import unittest
 import uuid
 import zipfile
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -23,6 +24,9 @@ from src.char.workshop.models import (
     TeamPackage,
     WorkshopFormatError,
     filter_catalog_entries,
+    group_catalog_entries,
+    parse_catalog,
+    parse_version,
 )
 from src.char.workshop.repository import IndexSource, WorkshopRepository, WorkshopRepositoryError
 from src.char.workshop.service import WorkshopInstallError, WorkshopPackageService
@@ -356,9 +360,7 @@ class TestWorkshop(unittest.TestCase):
         parent = QWidget()
         with patch.object(WorkshopDialog, "reload_catalog"):
             dialog = WorkshopDialog(repository, parent)
-        dialog.entries = [entry]
-        dialog.current_source = IndexSource("GitHub", "index", "base")
-        dialog._apply_filter()
+        dialog._catalog_loaded(([entry], IndexSource("GitHub", "index", "base")))
 
         self.assertEqual(dialog.table.columnCount(), 4)
         self.assertEqual(dialog.table.item(0, 0).text(), "测试方案")
@@ -368,3 +370,111 @@ class TestWorkshop(unittest.TestCase):
         self.assertTrue(dialog.import_button.isEnabled())
         dialog.deleteLater()
         parent.deleteLater()
+
+    def test_version_format_and_numeric_order(self):
+        self.assertGreater(parse_version("1.10.0"), parse_version("1.9.9"))
+        for version in (
+            "1", "1.0", "v1.0.0", "1.0.0-beta", "01.0.0", "1.00.0", "-1.0.0",
+            "\uff11.0.0", "1.0.0.0", "1.0.0\n", "1" * 33 + ".0.0",
+        ):
+            with self.subTest(version=version), self.assertRaises(WorkshopFormatError):
+                parse_version(version)
+        for version in ("0.0.0", "1.9.0", "1.10.0"):
+            data = {**self._package().to_dict(), "version": version}
+            self.assertEqual(TeamPackage.from_dict(data).version, version)
+        with self.assertRaises(WorkshopFormatError):
+            TeamPackage.from_dict({**self._package().to_dict(), "version": "1.0"})
+
+    def test_catalog_groups_by_author_and_name_not_members_or_commit_time(self):
+        old = CatalogEntry(
+            self._package(False), "codes/old.zip", "old.zip", 1, "2026-09-01T00:00:00Z"
+        )
+        latest = replace(
+            old,
+            package=replace(self._package(), version="1.10.0"),
+            archive="codes/latest.zip",
+            updated_at="2026-08-01T00:00:00Z",
+        )
+        intermediate = replace(old, package=replace(old.package, version="1.9.0"))
+        other_author = replace(old, package=replace(old.package, author="Other"))
+        other_name = replace(old, package=replace(old.package, name="Other strategy"))
+        groups = group_catalog_entries([old, intermediate, latest, other_author, other_name])
+        self.assertEqual(len(groups), 3)
+        self.assertEqual(groups[old.package.identity], (latest, intermediate, old))
+
+    def test_catalog_rejects_duplicate_named_version_even_with_different_slots(self):
+        data = {
+            **self._package().to_dict(),
+            "archive": "codes/a.zip",
+            "filename": "a.zip",
+            "size": 1,
+            "updated_at": "2026-09-01T00:00:00Z",
+        }
+        duplicate = {**data, "slots": self._package(False).to_dict()["slots"]}
+        with self.assertRaises(WorkshopFormatError):
+            parse_catalog({"format_version": 1, "packages": [data, duplicate]})
+
+    def test_workshop_selects_history_for_preview_and_import(self):
+        old = CatalogEntry(
+            self._package(False), "codes/old.zip", "old.zip", 1, "2026-09-01T00:00:00Z"
+        )
+        latest = replace(
+            old,
+            package=replace(self._package(), version="1.10.0", description="New rotation"),
+            archive="codes/latest.zip",
+            updated_at="2026-08-01T00:00:00Z",
+        )
+        source = IndexSource("GitHub", "index", "base")
+        parent = QWidget()
+        with patch.object(WorkshopDialog, "reload_catalog"):
+            dialog = WorkshopDialog(Mock(), parent)
+        imported = []
+        dialog.import_requested.connect(lambda entry, src: imported.append((entry, src)))
+        try:
+            for chinese, role in ((True, "零"), (False, "Zero")):
+                dialog.is_chinese = chinese
+                dialog._catalog_loaded(([old, latest], source))
+                roles = [dialog.role_combo.itemText(i) for i in range(dialog.role_combo.count())]
+                self.assertIn(role, roles)
+                self.assertNotIn("Zero" if chinese else "零", roles)
+                self.assertEqual(dialog.table.rowCount(), 1)
+                self.assertEqual(dialog.table.item(0, 3).text(), "1.10.0")
+                self.assertEqual(dialog.detail_body.toPlainText(), "New rotation")
+                dialog.import_button.click()
+                self.assertEqual(imported[-1], (latest, source))
+                dialog.version_combo.setCurrentIndex(1)
+                self.assertEqual(dialog.detail_body.toPlainText(), old.package.description)
+                self.assertEqual(dialog.slot_cards[1].title_label.text(), "-")
+                dialog.import_button.click()
+                self.assertEqual(imported[-1], (old, source))
+                dialog.search_edit.setText("Zero" if chinese else "零")
+                self.assertEqual(dialog.table.rowCount(), 1)
+                dialog.search_edit.setText(old.package.description)
+                self.assertEqual(dialog.table.rowCount(), 0)
+                dialog.search_edit.setText("no matches")
+                self.assertEqual(dialog.table.rowCount(), 0)
+                self.assertFalse(dialog.import_button.isEnabled())
+                self.assertEqual(dialog.version_combo.count(), 0)
+                dialog.search_edit.clear()
+        finally:
+            dialog.deleteLater()
+            parent.deleteLater()
+
+    def test_workshop_dialog_preserves_description_text(self):
+        package = TeamPackage(
+            "多行方案",
+            '第一行\n\n目录 C:\\new_team\n代码 print("\\n")\n字面量 \\r\\n',
+            "作者",
+            "1.0.0",
+            self._package(False).slots,
+        )
+        entry = CatalogEntry(package, "codes/test.zip", "test.zip", 100, "2026-01-01T00:00:00Z")
+        parent = QWidget()
+        with patch.object(WorkshopDialog, "reload_catalog"):
+            dialog = WorkshopDialog(Mock(), parent)
+        try:
+            dialog._catalog_loaded(([entry], IndexSource("GitHub", "index", "base")))
+            self.assertEqual(dialog.detail_body.toPlainText(), package.description)
+        finally:
+            dialog.deleteLater()
+            parent.deleteLater()

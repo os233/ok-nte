@@ -3,12 +3,16 @@
 - **Background Operation**: Automate game actions while in the background.
 
 ### 📅 Dailies/Weeklies
-- **One-click Dailies**: Automatically complete daily routines. Supports sub-items: EXP & Beetle Coins, Ability Upgrade, Arc Ascension, Console, Cafe Tasks, Cinema Date, and Bond Gifts.
-- **Bond Gifts**: Automatically send gifts to characters.
+
+Automatically complete selected daily and weekly tasks.
+
+- **One-click Dailies**: Run your configured task routine automatically.
+- **Available Tasks**: EXP & Beetle Coins, Ability Upgrade, Arc Ascension, Console, The Cafe by Origen, Cinema Date, Bond Gifts, Anomaly Furniture, Anomaly Hunt, and daily check-in at the Nacupeda Park fountain.
 
 ### 🍹 Hobbies
 - **Auto Fishing**: Fully automated fishing process.
 - **Auto Drum Rhythm Game**: Automatically complete drum rhythm games.
+- **Auto Auction**: Automate matchmaking, bidding, and settlement in "Going, Going, Gone!" (currently supports only the Chinese game interface).
 - **Owner's Selection**: Automatically loop entering and exiting stages (requires an in-game AFK build).
 - **Auto Pink Paws Heist**: Automatically complete Pink Paws Heist (410,000+ Force/hour, 2500+ Pink Paws Coins/hour).
 - **Pink Paws Heist Convenience Features**
@@ -18,8 +22,9 @@
 ### 📋 Specific AFK & Instances (Tasks)
 - **999 Nights**: AFK farming for EXP.
 - **Anomaly Domain**: Automate Anomaly Domain.
-- **Anomaly Hunts**：Automate Anomaly Hunts。
+- **Anomaly Hunt**: Automate Anomaly Hunt challenges.
 - **Auto Whirlwind**: Automatically completes 'Whirlwind' challenges.
+- **Volley Star**: Supports EXP farming and automatic match progression.
 - **Bagel Agent**: Automatically posts, replies, and likes in the Bagel community, or assists in generating copy in assistant mode.
 
 ### ⚡ Constant Triggers & Combat (Triggers/Character Center)

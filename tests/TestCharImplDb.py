@@ -1,5 +1,6 @@
 import json
 import os
+import py_compile
 import shutil
 import tempfile
 import unittest
@@ -90,7 +91,9 @@ class TestCharImplDb(unittest.TestCase):
         self.assertEqual(entry.source, "external")
         self.assertEqual(entry.char_cls.__name__, "FutureHero")
         self.assertEqual(entry.display_name("zh_CN"), "外置英雄")
-        self.assertEqual(registry.get_external_impl_ids_by_class_name("FutureHero"), ["external:hero"])
+        self.assertEqual(
+            registry.get_external_impl_ids_by_class_name("FutureHero"), ["external:hero"]
+        )
         self.assertIsNone(registry.get("external:futurehero"))
 
     def test_v7_external_implementation_ids_migrate_to_paths(self):
@@ -163,9 +166,7 @@ class TestCharImplDb(unittest.TestCase):
         preset = database.create_team_preset("Direct implementation")
 
         self.assertTrue(
-            database.update_team_preset(
-                preset["id"], slots=[{"char_id": "", "impl_id": combo_id}]
-            )
+            database.update_team_preset(preset["id"], slots=[{"char_id": "", "impl_id": combo_id}])
         )
         self.assertEqual(
             database.get_team_presets()[0]["slots"][0], {"char_id": "", "impl_id": combo_id}
@@ -176,7 +177,9 @@ class TestCharImplDb(unittest.TestCase):
 
         CustomCharDb.reset_instance()
         reloaded = CustomCharDb(self.db_path, self.features_dir, self.context)
-        self.assertEqual(reloaded.get_fixed_team()["slots"][0], {"char_id": "", "impl_id": combo_id})
+        self.assertEqual(
+            reloaded.get_fixed_team()["slots"][0], {"char_id": "", "impl_id": combo_id}
+        )
 
     def test_direct_implementation_builds_a_custom_character_without_a_record(self):
         external_chars_dir = os.path.join(self.temp_dir, "external_chars")
@@ -306,6 +309,93 @@ class TestCharImplDb(unittest.TestCase):
 
         self.assertIs(registry.get("builtin:zero"), builtin_entry)
         self.assertIsNotNone(registry.get("external:hero"))
+
+    def test_external_relative_imports_share_modules_and_isolate_directories(self):
+        external_dir = Path(self.temp_dir) / "external_chars"
+        for folder in ("中文队伍_1.0.0", "other"):
+            directory = external_dir / folder
+            directory.mkdir(parents=True)
+            (directory / "zankou.py").write_text(
+                "from src.char.BaseChar import BaseChar\n"
+                "shared = []\n"
+                "class Zankou(BaseChar):\n"
+                "    state = shared\n",
+                encoding="utf-8",
+            )
+            for filename in ("sakiri", "lingke", "hero.v1"):
+                (directory / f"{filename}.py").write_text(
+                    "from src.char.BaseChar import BaseChar\n"
+                    "from .zankou import Zankou, shared\n"
+                    "class Hero(BaseChar):\n"
+                    "    state = shared\n"
+                    "    teammate = Zankou\n",
+                    encoding="utf-8",
+                )
+        registry = CharRegistry(external_dir=external_dir)
+        for folder in ("中文队伍_1.0.0", "other"):
+            zankou = registry.get(f"external:{folder}/zankou").char_cls
+            for filename in ("sakiri", "lingke", "hero.v1"):
+                hero = registry.get(f"external:{folder}/{filename}").char_cls
+                self.assertIs(hero.teammate, zankou)
+                self.assertIs(hero.state, zankou.state)
+        first = registry.get("external:中文队伍_1.0.0/sakiri").char_cls
+        other = registry.get("external:other/sakiri").char_cls
+        first.state.append("first team")
+        self.assertEqual(other.state, [])
+
+    def test_external_rescan_refreshes_lazy_import_without_timestamp_change(self):
+        external_dir = Path(self.temp_dir) / "external_lazy"
+        external_dir.mkdir()
+        shared = external_dir / "_shared.py"
+        shared.write_text("value = 'before'\n", encoding="utf-8")
+        original_stat = shared.stat()
+        (external_dir / "hero.py").write_text(
+            "from src.char.BaseChar import BaseChar\n"
+            "class Hero(BaseChar):\n"
+            "    @staticmethod\n"
+            "    def read():\n"
+            "        from ._shared import value\n"
+            "        return value\n",
+            encoding="utf-8",
+        )
+        registry = CharRegistry(external_dir=external_dir)
+        self.assertEqual(registry.get("external:hero").char_cls.read(), "before")
+        py_compile.compile(str(shared), doraise=True)
+        shared.write_text("value = 'after!'\n", encoding="utf-8")
+        os.utime(shared, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+
+        registry.rescan_external()
+
+        self.assertEqual(registry.get("external:hero").char_cls.read(), "after!")
+
+    def test_external_rescan_refreshes_dependencies_without_timestamp_change(self):
+        external_dir = Path(self.temp_dir) / "external_chars"
+        external_dir.mkdir()
+        shared = external_dir / "_shared.py"
+        shared.write_text("value = 'before'\n", encoding="utf-8")
+        py_compile.compile(str(shared), doraise=True)
+        original_stat = shared.stat()
+        hero = external_dir / "hero.py"
+        hero.write_text(
+            "from src.char.BaseChar import BaseChar\n"
+            "from ._shared import value\n"
+            "class Hero(BaseChar):\n"
+            "    en_name = value\n",
+            encoding="utf-8",
+        )
+        registry = CharRegistry(external_dir=external_dir)
+        self.assertEqual(registry.get("external:hero").en_name, "before")
+        shared.write_text("value = 'after!'\n", encoding="utf-8")
+        os.utime(shared, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+        registry.rescan_external()
+        self.assertEqual(registry.get("external:hero").en_name, "after!")
+
+        shared.unlink()
+        registry.rescan_external()
+        self.assertIsNone(registry.get("external:hero"))
+        shared.write_text("value = 'fixed!'\n", encoding="utf-8")
+        registry.rescan_external()
+        self.assertEqual(registry.get("external:hero").en_name, "fixed!")
 
 
 if __name__ == "__main__":

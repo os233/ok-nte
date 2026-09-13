@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QGridLayout,
     QHBoxLayout,
+    QSizePolicy,
     QTableWidgetItem,
     QTextEdit,
     QVBoxLayout,
@@ -17,6 +18,7 @@ from PySide6.QtWidgets import (
 from qfluentwidgets import (
     BodyLabel,
     CaptionLabel,
+    ComboBox,
     FluentIcon,
     IndeterminateProgressRing,
     LineEdit,
@@ -27,10 +29,18 @@ from qfluentwidgets import (
     StrongBodyLabel,
     SubtitleLabel,
     TableWidget,
+    TextBrowser,
 )
 
 from src.char.custom.CustomCharManager import CustomCharManager
-from src.char.workshop.models import CatalogEntry, TeamPackage, filter_catalog_entries
+from src.char.workshop.models import (
+    CatalogEntry,
+    TeamPackage,
+    WorkshopFormatError,
+    filter_catalog_entries,
+    group_catalog_entries,
+    parse_version,
+)
 from src.char.workshop.repository import IndexSource, WorkshopRepository
 from src.ui.features.characters.safety_dialog import EXTERNAL_CODE_SAFETY_NOTICE
 from src.ui.foundation.dialogs import MessageBoxBase
@@ -139,6 +149,8 @@ class PackageMetadataDialog(MessageBoxBase):
 
         self.viewLayout.addWidget(BodyLabel(self.tr("版本"), self))
         self.version_edit = LineEdit(self)
+        self.version_edit.setPlaceholderText("1.0.0")
+        self.version_edit.setToolTip("major.minor.patch (1.0.0)")
         self.version_edit.setText(defaults.version)
         self.viewLayout.addWidget(self.version_edit)
 
@@ -152,11 +164,15 @@ class PackageMetadataDialog(MessageBoxBase):
         self._validate()
 
     def _validate(self) -> None:
+        try:
+            parse_version(self.version_edit.text().strip())
+            valid_version = True
+        except WorkshopFormatError:
+            valid_version = False
+        self.version_edit.setError(not valid_version)
         self.yesButton.setEnabled(
             bool(
-                self.name_edit.text().strip()
-                and self.author_edit.text().strip()
-                and self.version_edit.text().strip()
+                self.name_edit.text().strip() and self.author_edit.text().strip() and valid_version
             )
         )
 
@@ -176,18 +192,16 @@ class PackageImportDialog(MessageBoxBase):
         self.viewLayout.setSpacing(6)
         self.viewLayout.addWidget(SubtitleLabel(package.name, self))
         summary = f"{self.tr('作者')}: {package.author}\n{self.tr('版本')}: {package.version}"
-        if package.description:
-            summary += f"\n{package.description}"
         self.viewLayout.addWidget(BodyLabel(summary, self))
-        members = ", ".join(slot.display["zh_CN"] for slot in package.slots)
+        members = ", ".join(package.members("zh_CN" if is_chinese() else "en_US"))
         self.viewLayout.addWidget(CaptionLabel(f"{self.tr('成员')}: {members}", self))
 
-        self.viewLayout.addWidget(BodyLabel(self.tr("本地方案名称"), self))
+        self.viewLayout.addWidget(StrongBodyLabel(self.tr("本地方案名称"), self))
         self.preset_name_edit = LineEdit(self)
         self.preset_name_edit.setText(package.name)
         self.viewLayout.addWidget(self.preset_name_edit)
 
-        self.viewLayout.addWidget(BodyLabel(self.tr("外置代码目录"), self))
+        self.viewLayout.addWidget(StrongBodyLabel(self.tr("外置代码目录"), self))
         self.directory_edit = LineEdit(self)
         try:
             self.directory_edit.setText(
@@ -237,6 +251,7 @@ class WorkshopDialog(MessageBoxBase):
         self.repository = repository
         self.is_chinese = is_chinese()
         self.entries: list[CatalogEntry] = []
+        self.versions: dict[tuple[str, str], tuple[CatalogEntry, ...]] = {}
         self.current_source: IndexSource | None = None
         self._worker: BackgroundCall | None = None
         self.viewLayout.setSpacing(12)
@@ -279,10 +294,9 @@ class WorkshopDialog(MessageBoxBase):
         split_layout.setSpacing(12)
 
         # Left: compact table with user-resizable columns
-        self.table_card = SimpleCardWidget(self)
-        table_layout = QVBoxLayout(self.table_card)
-        table_layout.setContentsMargins(8, 8, 8, 8)
-        self.table = TableWidget(self.table_card)
+        self.table = TableWidget(self)
+        self.table.setBorderVisible(True)
+        self.table.setBorderRadius(8)
         self.table.setColumnCount(4)
         self.table.setHorizontalHeaderLabels(
             [
@@ -297,17 +311,17 @@ class WorkshopDialog(MessageBoxBase):
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
         self.table.setWordWrap(False)
-        self.table.setColumnWidth(0, 160)
-        self.table.setColumnWidth(1, 260)
+        self.table.setColumnWidth(0, 166)
+        self.table.setColumnWidth(1, 270)
         self.table.setColumnWidth(2, 100)
         self.table.setColumnWidth(3, 80)
         self.table.verticalHeader().hide()
         self.table.verticalHeader().setDefaultSectionSize(34)
-        table_layout.addWidget(self.table)
-        split_layout.addWidget(self.table_card, 3)
+        split_layout.addWidget(self.table, 3)
 
-        # Right: detail panel
+        # Right: detail panel (fixed width avoids relayout jitter on selection)
         self.detail_card = SimpleCardWidget(self)
+        self.detail_card.setFixedWidth(420)
         detail_layout = QVBoxLayout(self.detail_card)
         detail_layout.setContentsMargins(18, 14, 18, 14)
         detail_layout.setSpacing(8)
@@ -328,20 +342,27 @@ class WorkshopDialog(MessageBoxBase):
         detail_layout.addLayout(slots_grid)
 
         detail_layout.addWidget(StrongBodyLabel(self.tr("方案说明"), self.detail_card))
-        self.detail_body = BodyLabel(
-            self.tr("工坊会显示来自公开仓库的 ZIP 方案."), self.detail_card
-        )
-        self.detail_body.setWordWrap(True)
-        detail_layout.addWidget(self.detail_body)
+        self.detail_body = TextBrowser(self.detail_card)
+        self.detail_body.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
+        self.detail_body.setPlainText(self.tr("工坊会显示来自公开仓库的 ZIP 方案."))
+        detail_layout.addWidget(self.detail_body, 1)
 
-        detail_layout.addStretch(1)
+        action_layout = QHBoxLayout()
+        action_layout.setSpacing(8)
+        self.version_combo = ComboBox(self.detail_card)
+        self.version_combo.setEnabled(False)
+        self.version_combo.setMinimumWidth(95)
+        self.version_combo.setToolTip(self.tr("版本"))
+        action_layout.addWidget(self.version_combo, alignment=Qt.AlignmentFlag.AlignVCenter)
+        action_layout.addStretch(1)
 
         self.import_button = PrimaryPushButton(
             FluentIcon.DOWNLOAD, self.tr("导入"), self.detail_card
         )
         self.import_button.setEnabled(False)
-        detail_layout.addWidget(self.import_button, alignment=Qt.AlignmentFlag.AlignRight)
-        split_layout.addWidget(self.detail_card, 2)
+        action_layout.addWidget(self.import_button, alignment=Qt.AlignmentFlag.AlignVCenter)
+        detail_layout.addLayout(action_layout)
+        split_layout.addWidget(self.detail_card)
 
         self.viewLayout.addLayout(split_layout, 1)
 
@@ -353,6 +374,7 @@ class WorkshopDialog(MessageBoxBase):
         self.role_combo.currentTextChanged.connect(self._apply_filter)
         self.author_combo.currentTextChanged.connect(self._apply_filter)
         self.table.itemSelectionChanged.connect(self._show_selection)
+        self.version_combo.currentIndexChanged.connect(self._show_version)
         self.refresh_button.clicked.connect(lambda: self.reload_catalog(force_refresh=True))
         self.import_button.clicked.connect(self._request_import)
         self.reload_catalog()
@@ -369,7 +391,9 @@ class WorkshopDialog(MessageBoxBase):
         self._worker.start()
 
     def _catalog_loaded(self, result: object) -> None:
-        self.entries, self.current_source = cast(tuple[list[CatalogEntry], IndexSource], result)
+        entries, self.current_source = cast(tuple[list[CatalogEntry], IndexSource], result)
+        self.versions = group_catalog_entries(entries)
+        self.entries = [versions[0] for versions in self.versions.values()]
         self._rebuild_filters()
         self._apply_filter()
         self.refresh_button.setEnabled(True)
@@ -384,16 +408,17 @@ class WorkshopDialog(MessageBoxBase):
     def _rebuild_filters(self) -> None:
         current_role = self.role_combo.currentText()
         current_author = self.author_combo.currentText()
+        self.role_combo.blockSignals(True)
+        self.author_combo.blockSignals(True)
         self.role_combo.clear()
         self.author_combo.clear()
         self.role_combo.addItem("")
         self.author_combo.addItem("")
         roles = sorted(
             {
-                name
+                slot.display_name("zh_CN" if self.is_chinese else "en_US")
                 for entry in self.entries
                 for slot in entry.package.slots
-                for name in slot.display.values()
             }
         )
         authors = sorted({entry.package.author for entry in self.entries})
@@ -403,6 +428,8 @@ class WorkshopDialog(MessageBoxBase):
             self.author_combo.addItem(author)
         self.role_combo.setCurrentText(current_role)
         self.author_combo.setCurrentText(current_author)
+        self.role_combo.blockSignals(False)
+        self.author_combo.blockSignals(False)
 
     def _apply_filter(self, *_args) -> None:
         visible = filter_catalog_entries(
@@ -447,12 +474,23 @@ class WorkshopDialog(MessageBoxBase):
 
     def _show_selection(self) -> None:
         item = self.table.item(self.table.currentRow(), 0)
-        entry = item.data(Qt.ItemDataRole.UserRole) if item else None
+        entry = cast(CatalogEntry, item.data(Qt.ItemDataRole.UserRole)) if item else None
+        self.version_combo.blockSignals(True)
+        self.version_combo.clear()
+        if entry is not None:
+            for version in self.versions[entry.package.identity]:
+                self.version_combo.addItem(version.package.version, userData=version)
+        self.version_combo.setEnabled(self.version_combo.count() > 1)
+        self.version_combo.blockSignals(False)
+        self._show_version()
+
+    def _show_version(self, *_args) -> None:
+        entry = cast(CatalogEntry | None, self.version_combo.currentData())
         self.import_button.setEnabled(entry is not None and self.current_source is not None)
         if entry is None:
             self.detail_title.setText(self.tr("选择一个方案"))
             self.detail_meta.setText("")
-            self.detail_body.setText(self.tr("调整筛选条件或稍后刷新工坊."))
+            self.detail_body.setPlainText(self.tr("调整筛选条件或稍后刷新工坊."))
             for card in self.slot_cards:
                 card.clear()
             return
@@ -467,7 +505,7 @@ class WorkshopDialog(MessageBoxBase):
             f"{self.tr('更新时间')}: {entry.updated_at.replace('T', ' ').removesuffix('Z')}"
         )
         self.detail_meta.setText(f"{meta_line1}\n{meta_line2}")
-        self.detail_body.setText(package.description or self.tr("没有说明."))
+        self.detail_body.setPlainText(package.description or self.tr("没有说明."))
         slot_map = {slot.index: slot for slot in package.slots}
         for index in range(4):
             slot = slot_map.get(index)
@@ -481,6 +519,6 @@ class WorkshopDialog(MessageBoxBase):
                 self.slot_cards[index].clear()
 
     def _request_import(self) -> None:
-        item = self.table.item(self.table.currentRow(), 0)
-        if item is not None and self.current_source is not None:
-            self.import_requested.emit(item.data(Qt.ItemDataRole.UserRole), self.current_source)
+        entry = self.version_combo.currentData()
+        if entry is not None and self.current_source is not None:
+            self.import_requested.emit(entry, self.current_source)
