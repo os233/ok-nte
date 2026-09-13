@@ -1,3 +1,4 @@
+import math
 import re
 import time
 from dataclasses import dataclass
@@ -19,6 +20,8 @@ RE_EXIT = re.compile(r"退\s*出")
 RE_BID_CONFIRM = re.compile(r"确认出价")
 RE_BID_PANEL_READY = re.compile(r"确认出价|[0-9]")
 RE_NUMBER = re.compile(r"[0-9\uff10-\uff19,]+")
+# 价格输入区未输入时显示 "可输入范围0~<资产>" 提示, 同样能被 RE_NUMBER 命中, 不能当作价格.
+RE_PRICE_HINT = re.compile(r"[~\uff5e\u4e00-\u9fff]")
 RE_CONFIRM_ANY = re.compile(r"确认")
 RE_MAIN_ASSET_TITLE = re.compile(r"我的资产")
 RE_COLLECTION_INSUFFICIENT = re.compile(r"少于200格")
@@ -178,13 +181,14 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
     MATCH_CLICK_TIMEOUT = 30
     BID_RESULT_TIMEOUT = 60
     RESULT_TIMEOUT = 90
+    # 结算画面存在跳过动画已出现而退出按钮尚未渲染的中间态, 等待不能太短.
+    EXIT_BUTTON_TIMEOUT = 10
     ASSET_OCR_TIMEOUT = 15
 
     # --- 轮询与重试 ---
     POLL_INTERVAL = 0.5
     MATCH_MAX_LOOPS = 120
     RESULT_MAX_LOOPS = 180
-    MAX_FAILURES = 3
     BID_MAX_RETRIES = 3
 
     # 资产低于该值时领取低保金.
@@ -280,6 +284,7 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
     def do_run(self):
         """主执行逻辑, 使用基类的轮次管理框架。"""
         self.start_rounds()
+        self._validate_price_config()
         boxes = self._build_boxes()
         try:
             while self.has_remaining_rounds():
@@ -328,14 +333,17 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         )
 
     def _run_single_round(self, boxes: AuctionBoxes) -> None:
-        """执行一轮拍卖, 记录结果并按需触发定期出售。"""
-        if self._exec_auction_round(boxes):
+        """执行一轮拍卖, 记录结果并仅在回到主界面时触发定期出售。"""
+        finished = self._exec_auction_round(boxes)
+        if finished:
             self.add_success()
         else:
             self.add_failed("结果阶段进入下一轮出价")
 
         self.log_info(f"本轮拍卖完成 ({self.current_round}/{self._round_state.total_text})")
-        self._sell_collections_on_interval(boxes)
+        if finished:
+            # 返回 False 时画面仍在拍卖出价界面, 此时出售只会在仓库入口白等超时.
+            self._sell_collections_on_interval(boxes)
 
     # --- 单轮流程编排 ---
     def _exec_auction_round(self, boxes: AuctionBoxes) -> bool:
@@ -408,7 +416,6 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         """
         self.log_info("匹配阶段开始, 等待确认或出价界面")
         stage_deadline = min(deadline, time.monotonic() + self.MATCH_TIMEOUT)
-        fail_count = 0
         loop_count = 0
 
         while loop_count < self.MATCH_MAX_LOOPS and time.monotonic() < stage_deadline:
@@ -428,20 +435,11 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
                 return AuctionState.SKIP
 
             # 仅在"开始匹配"按钮确实存在时才尝试点击.
+            # 点击后界面未变化时返回 None 继续轮询; 单轮 deadline 到期由内部抛出超时.
             if self._is_match_screen(boxes):
-                try:
-                    result = self._handle_match_click(boxes, stage_deadline)
-                    if result is not None:
-                        return result
-                except TaskDisabledException:
-                    raise
-                except WaitFailedException:
-                    fail_count += 1
-                    self.log_warning(
-                        f"匹配状态等待失败 ({fail_count}/{self.MAX_FAILURES}), 将继续重试"
-                    )
-                    if fail_count >= self.MAX_FAILURES:
-                        raise WaitFailedException("匹配阶段连续失败")
+                result = self._handle_match_click(boxes, stage_deadline)
+                if result is not None:
+                    return result
 
             self.sleep(self.POLL_INTERVAL)
 
@@ -514,6 +512,7 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         """出价阶段: 循环出价直到拍卖结束, 支持多轮竞拍。
 
         每次出价结果最多等待 BID_RESULT_TIMEOUT 秒, 整个阶段仍受单轮 deadline 约束。
+        资产为 0 时放弃本次出价并等待拍卖结束, 放弃不计入出价序号。
         """
         # 每轮拍卖开始前重置出价计数和上次价格.
         self.current_bid_count = 0
@@ -525,7 +524,7 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         while True:
             self._remaining_timeout(deadline, 0.1)
             try:
-                self._attempt_bid(boxes, deadline)
+                bid_placed = self._attempt_bid(boxes, deadline)
             except TaskDisabledException:
                 raise
             except Exception as e:
@@ -538,10 +537,13 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
                 self.sleep(1)
                 continue
 
-            # 出价成功后重置失败重试计数, 用于下一次出价.
+            # 尝试完成(无论是否真正出价)后重置失败重试计数, 用于下一次尝试.
             retry = 0
-            self.current_bid_count += 1
-            self.log_info(f"第 {self.current_bid_count} 次出价成功, 等待拍卖结果或加价")
+            if bid_placed:
+                self.current_bid_count += 1
+                self.log_info(f"第 {self.current_bid_count} 次出价成功, 等待拍卖结果或加价")
+            else:
+                self.log_info("本次出价已放弃, 等待拍卖结果")
 
             if self._wait_bid_outcome(boxes, deadline):
                 return
@@ -571,10 +573,12 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         self.log_info(f"本次出价结果等待 {self.BID_RESULT_TIMEOUT} 秒未变化, 按拍卖结束处理")
         return True
 
-    def _attempt_bid(self, boxes: AuctionBoxes, deadline: float) -> None:
+    def _attempt_bid(self, boxes: AuctionBoxes, deadline: float) -> bool:
         """单次出价尝试: 包含资产识别, 出价面板确认和可选表情包动作。
 
         失败时抛出 WaitFailedException, 由调用方决定是否重试。
+        Returns:
+            bool: True 表示已提交出价; False 表示资产为 0 已放弃本次出价。
         """
         # 等待确认后的加载动画完成, 再判断资产值.
         asset_value = self._read_asset_value(
@@ -584,17 +588,35 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
             self.log_warning("资产值识别失败, 准备重试本次出价")
             raise WaitFailedException("资产值未识别")
 
-        # 资产明确为 0 时放弃本轮出价.
+        # 资产为 0 时放弃本轮出价; 单次误读就放弃整场拍卖代价过高, 放弃前需二次确认.
         if asset_value == 0:
-            self.log_info("当前资产值为 0, 放弃本轮出价")
-            self.operate_click(boxes.abandon, after_sleep=0.5)
-            self.sleep(0.5)
-            self.operate_click(boxes.abandon_confirm, after_sleep=0.5)
-            return
+            confirm_value = self._read_asset_value(
+                boxes.asset_value, self._remaining_timeout(deadline, self.ASSET_OCR_TIMEOUT)
+            )
+            if confirm_value is None:
+                self.log_warning("资产值二次识别失败, 准备重试本次出价")
+                raise WaitFailedException("资产值未识别")
+            if confirm_value != 0:
+                self.log_warning(f"资产二次识别为 {confirm_value}, 首次读数 0 判定为误读, 继续出价")
+                asset_value = confirm_value
+            else:
+                self.log_info("当前资产值两次识别均为 0, 放弃本轮出价")
+                self.operate_click(boxes.abandon, after_sleep=0.5)
+                self.sleep(0.5)
+                self.operate_click(boxes.abandon_confirm, after_sleep=0.5)
+                abandoned = self.wait_until(
+                    lambda: not self._is_bid_screen(boxes),
+                    time_out=self._remaining_timeout(deadline, 5),
+                    settle_time=0.5,
+                    raise_if_not_found=False,
+                )
+                if not abandoned:
+                    self.log_warning("点击放弃后仍在出价界面, 准备重试本次尝试")
+                    raise WaitFailedException("放弃出价失败")
+                return False
 
-        self.log_debug(f"当前资产值为 {asset_value}, 不等于 0, 继续执行出价")
+        self.log_debug(f"当前资产值为 {asset_value}, 继续执行出价")
 
-        # 继续执行常规出价流程.
         self.log_info("等待出价按钮")
         found = self.wait_click_ocr(
             box=boxes.bid,
@@ -632,6 +654,8 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
 
         if self.config.get(self.CONF_USE_EMOTE, False):
             self._send_emote()
+
+        return True
 
     def _stage_result(self, boxes: AuctionBoxes, deadline: float) -> bool:
         """结果阶段: 等待结算, 处理跳过动画或返回匹配界面。
@@ -673,7 +697,7 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         exit_button = self.wait_click_ocr(
             box=boxes.exit,
             match=RE_EXIT,
-            time_out=self._remaining_timeout(deadline, 5),
+            time_out=self._remaining_timeout(deadline, self.EXIT_BUTTON_TIMEOUT),
             after_sleep=0.5,
             raise_if_not_found=False,
             settle_time=0.5,
@@ -706,7 +730,7 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
             self._claim_welfare_if_needed(boxes, deadline)
 
         if need_clear_collections:
-            self.log_info("根据之前的标记, 现在执行自动清理藏品")
+            self.log_info("检测到库存不足标记, 执行自动清理藏品")
             self._sell_collections(boxes, deadline)
 
     def _should_clear_collections(self, boxes: AuctionBoxes, deadline: float) -> bool:
@@ -796,6 +820,26 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
             return [int(item) for item in self.config.get(key, [])]
         except (TypeError, ValueError):
             return []
+
+    def _validate_price_config(self) -> None:
+        """任务开始前校验价格相关配置, 非法时直接终止任务。
+
+        出价面板打开后才发现非法配置, 会以每轮 3 次重试的方式空转, 必须在入口拦截。
+        """
+        base_raw = self.config.get(self.CONF_FIXED_PRICE)
+        try:
+            base_price = int(base_raw)
+        except (TypeError, ValueError):
+            raise ValueError(f"基础价配置非法: {base_raw!r}") from None
+        if base_price <= 0:
+            raise ValueError(f"基础价必须为正整数, 当前: {base_raw!r}")
+
+        if self.config.get(self.CONF_AUTO_RAISE, False):
+            raise_value = self._config_float(self.CONF_RAISE_VALUE, 0.0)
+            if not math.isfinite(raise_value):
+                raise ValueError(
+                    f"加价数值配置非法: {self.config.get(self.CONF_RAISE_VALUE)!r}"
+                )
 
     # --- 资产解析 ---
     @staticmethod
@@ -969,7 +1013,10 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         return keys
 
     def _verify_input_price(self, boxes: AuctionBoxes, price: int, deadline: float | None) -> None:
-        """校验数字面板显示的价格与目标价格一致, 不一致时抛出异常。"""
+        """校验数字面板显示的价格与目标价格一致, 不一致时抛出异常。
+
+        价格区未输入时显示 "可输入范围0~<资产>" 提示文本, 视为未识别处理。
+        """
         price_boxes = self.wait_ocr(
             box=boxes.price_result,
             match=RE_NUMBER,
@@ -982,6 +1029,10 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
             raise WaitFailedException("输入价格结果未识别")
 
         raw_price = "".join(text_box.name for text_box in price_boxes)
+        if RE_PRICE_HINT.search(raw_price):
+            self.log_warning("价格区仍显示可输入范围提示, 视为未输入, 取消确认并重试当前出价")
+            raise WaitFailedException("输入价格结果未识别")
+
         input_price = self._parse_asset_value(raw_price)
         self.log_debug(f"输入价格结果 OCR: '{raw_price}', 解析值: {input_price}")
         if input_price != price:
@@ -1001,7 +1052,7 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
             raise_if_not_found=False,
         )
         if not confirmed:
-            self.log_warning("确认出价失败, 5秒内未完成点击, 准备重试当前出价")
+            self.log_warning("确认出价点击超时, 准备重试当前出价")
             raise WaitFailedException("确认出价失败")
 
         # 检测是否出现异常确认框 (非必须等待, 用一次性 ocr 避免每次出价都白等).
@@ -1009,20 +1060,29 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
             self.operate_click(boxes.exception_area, after_sleep=0.3)
             self.log_info("检测到异常确认框, 点击确认")
         else:
-            self.log_info("未检测到异常确认框")
+            self.log_debug("未检测到异常确认框")
 
     # --- 低保金 ---
     def _try_claim_welfare(self, boxes: AuctionBoxes, deadline: float | None = None) -> bool:
-        """尝试领取每日低保金, deadline 为空时保持原有独立超时行为。"""
+        """尝试领取每日低保金, deadline 为空时保持原有独立超时行为。
+
+        低保金是可选的附加流程, 按钮未出现(如当日已领取)或弹窗异常时只跳过本次领取;
+        只有单轮超时才向上传播, 避免拖垮已经成功的拍卖轮次。
+        """
         try:
             self.log_info("执行低保金领取流程")
-            self._wait_click_or_fail(boxes.welfare_btn, RE_WELFARE, deadline, 5, "低保金按钮")
+            if not self._wait_click_optional(
+                boxes.welfare_btn, RE_WELFARE, deadline, 5, "低保金按钮"
+            ):
+                return False
             self._bounded_sleep(deadline, 0.5)
 
-            self._wait_click_or_fail(boxes.claim, RE_CLAIM, deadline, 5, "领取按钮")
+            if not self._wait_click_optional(boxes.claim, RE_CLAIM, deadline, 5, "领取按钮"):
+                return False
             self._bounded_sleep(deadline, 0.5)
 
-            self._wait_click_or_fail(boxes.cancel, RE_CANCEL, deadline, 5, "取消按钮")
+            if not self._wait_click_optional(boxes.cancel, RE_CANCEL, deadline, 5, "取消按钮"):
+                return False
             self._bounded_sleep(deadline, 0.5)
 
             cancel_closed = self.wait_until(
@@ -1032,7 +1092,8 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
                 raise_if_not_found=False,
             )
             if not cancel_closed:
-                raise WaitFailedException("低保金弹窗未关闭")
+                self.log_warning("低保金弹窗未关闭, 跳过本次领取的后续确认")
+                return False
 
             self.log_info("低保金领取完成")
             return True
@@ -1044,15 +1105,15 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
             self.log_warning(f"低保金领取失败: {type(e).__name__}: {e}")
             return False
 
-    def _wait_click_or_fail(
+    def _wait_click_optional(
         self,
         box: Box,
         match: re.Pattern,
         deadline: float | None,
         timeout: float,
         desc: str,
-    ) -> None:
-        """等待并点击目标控件, 超时未出现时抛出 WaitFailedException。"""
+    ) -> bool:
+        """等待并点击目标控件, 超时未出现时返回 False; deadline 到期仍会抛出单轮超时。"""
         clicked = self.wait_click_ocr(
             box=box,
             match=match,
@@ -1061,11 +1122,15 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
             settle_time=0.5,
         )
         if not clicked:
-            raise WaitFailedException(f"{desc}未出现")
+            self.log_warning(f"{desc}未出现, 跳过本次操作")
+        return bool(clicked)
 
     # --- 藏品出售 ---
     def _sell_collections_on_interval(self, boxes: AuctionBoxes) -> None:
-        """按配置的间隔轮次出售藏品, 启用自动清理时禁用该定期出售。"""
+        """按配置的间隔轮次出售藏品, 启用自动清理时禁用该定期出售。
+
+        仅应在拍卖结束回到主界面后调用, 否则仓库入口 OCR 无法命中。
+        """
         if self.config.get(self.CONF_AUTO_CLEAR_COLLECTIONS, False):
             return
 
@@ -1073,6 +1138,9 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
             self.CONF_SELL_INTERVAL, 0, warn="出售间隔次数配置无效, 按 0 处理"
         )
         if sell_interval > 0 and self.current_round % sell_interval == 0:
+            self.log_info(
+                f"第 {self.current_round} 轮到达出售间隔 {sell_interval}, 执行定期出售"
+            )
             self._sell_collections(boxes)
 
     def _sell_collections(self, boxes: AuctionBoxes, deadline: float | None = None) -> bool:
@@ -1087,7 +1155,7 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
                 raise_if_not_found=False,
             )
             if not warehouse_button:
-                self.log_warning("未点击藏品仓库入口, 取消出售流程")
+                self.log_warning("藏品仓库入口未出现, 取消出售流程")
                 return False
             self._bounded_sleep(deadline, 1)
             self.log_info("藏品仓库入口已点击")
@@ -1109,7 +1177,7 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
 
             self.operate_click(boxes.confirm_sell, after_sleep=0)
             self._bounded_sleep(deadline, 1.5)
-            self.log_info("确认出售")
+            self.log_info("已点击确认出售")
 
             self.operate_click(boxes.blank, after_sleep=0)
             self._bounded_sleep(deadline, 0.5)
@@ -1141,6 +1209,5 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         """发送表情菜单中的第一个表情。"""
         self.log_info("发送表情包")
         self.operate_click(*self.EMOTE_BTN, after_sleep=0.8)
-        self.sleep(0.8)
         self.operate_click(*self.EMOTE_FIRST, after_sleep=0.5)
         self.log_info("表情包发送完成")

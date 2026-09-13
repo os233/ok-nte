@@ -1,9 +1,11 @@
 import time
 import unittest
+from types import SimpleNamespace
 
-from ok import WaitFailedException
+from ok import Box, WaitFailedException
 
 from src.tasks.AutoBidAuctionTask import AutoBidAuctionTask
+from src.tasks.mixin.RoundMixin import RoundState
 
 
 class TestAutoBidAuctionTask(unittest.TestCase):
@@ -272,6 +274,188 @@ class TestAutoBidAuctionTask(unittest.TestCase):
         self.assertEqual(task._bounded_timeout(time.monotonic() + 10, 5), 5)
         with self.assertRaises(WaitFailedException):
             task._bounded_timeout(time.monotonic() - 1, 5)
+
+    # --- 轮次结果处理 ---
+    def _make_round_task(self, round_result: bool):
+        task = self._make_task()
+        task._round_state = RoundState(total=0)
+        task.calls = []
+
+        def fake_exec(boxes):
+            task.calls.append(("round", round_result))
+            return round_result
+
+        task._exec_auction_round = fake_exec
+        task.add_success = lambda: task.calls.append(("success",))
+        task.add_failed = lambda reason: task.calls.append(("failed", reason))
+        task._sell_collections_on_interval = lambda boxes: task.calls.append(("sell",))
+        return task
+
+    def test_run_single_round_skips_periodic_sell_when_still_bidding(self):
+        """进入下一轮出价(未回主界面)时不得触发定期出售, 否则仓库入口会白等超时。"""
+        task = self._make_round_task(False)
+        task._run_single_round(boxes=None)
+
+        self.assertNotIn(("sell",), task.calls)
+        self.assertIn(("failed", "结果阶段进入下一轮出价"), task.calls)
+        self.assertNotIn(("success",), task.calls)
+
+    def test_run_single_round_triggers_periodic_sell_after_finish(self):
+        task = self._make_round_task(True)
+        task._run_single_round(boxes=None)
+
+        self.assertIn(("sell",), task.calls)
+        self.assertIn(("success",), task.calls)
+        self.assertNotIn(("failed", "结果阶段进入下一轮出价"), task.calls)
+
+    # --- 价格校验与出价尝试 ---
+    def test_verify_input_price_rejects_range_hint_even_when_price_equals_asset(self):
+        """未输入时价格区显示 "可输入范围0~<资产>" 提示, 即使目标价恰等于资产也不能误判通过。"""
+        task = self._make_task()
+        task.wait_ocr = lambda **kwargs: [Box(0, 0, 1, 1, name="可输入范围0~16,155,238")]
+        boxes = SimpleNamespace(price_result=1)
+
+        with self.assertRaises(WaitFailedException):
+            task._verify_input_price(boxes, 16155238, None)
+
+    def test_verify_input_price_accepts_typed_price(self):
+        task = self._make_task()
+        task.wait_ocr = lambda **kwargs: [Box(0, 0, 1, 1, name="1,000,000")]
+        boxes = SimpleNamespace(price_result=1)
+
+        task._verify_input_price(boxes, 1000000, None)
+
+    def test_verify_input_price_rejects_mismatched_price(self):
+        task = self._make_task()
+        task.wait_ocr = lambda **kwargs: [Box(0, 0, 1, 1, name="500")]
+        boxes = SimpleNamespace(price_result=1)
+
+        with self.assertRaises(WaitFailedException):
+            task._verify_input_price(boxes, 1000000, None)
+
+    def _make_bid_task(self, reads):
+        """构造可离线驱动 _attempt_bid 的最小桩, reads 依次作为资产识别返回值。"""
+        task = self._make_task()
+        task.calls = []
+        read_iter = iter(reads)
+
+        def fake_read(box, timeout):
+            value = next(read_iter)
+            task.calls.append(("read", value))
+            return value
+
+        def fake_click(*args, **kwargs):
+            task.calls.append(("click", args[0] if args else None))
+            return True
+
+        task._read_asset_value = fake_read
+        task.operate_click = fake_click
+        task.sleep = lambda t: task.calls.append(("sleep",))
+        task._remaining_timeout = lambda deadline, limit: limit
+        task.wait_click_ocr = lambda **kwargs: task.calls.append(("wait_click",)) or [object()]
+        task.wait_ocr = lambda **kwargs: task.calls.append(("wait_ocr",)) or [object()]
+        task.wait_until = lambda *args, **kwargs: task.calls.append(("wait_until",)) or True
+        task._input_fixed_price = lambda *args, **kwargs: task.calls.append(("input",))
+        return task
+
+    def test_attempt_bid_abandons_only_after_two_zero_reads(self):
+        task = self._make_bid_task([0, 0])
+        boxes = SimpleNamespace(asset_value=1, abandon=2, abandon_confirm=3, bid=4, bid_confirm=5)
+
+        task._attempt_bid(boxes, time.monotonic() + 60)
+
+        self.assertEqual([c for c in task.calls if c[0] == "click"], [("click", 2), ("click", 3)])
+        self.assertNotIn(("input",), task.calls)
+
+    def test_attempt_bid_continues_when_second_read_is_not_zero(self):
+        """首次读到 0 但二次读数正常时, 应继续出价而不是放弃。"""
+        task = self._make_bid_task([0, 7000])
+        boxes = SimpleNamespace(asset_value=1, abandon=2, abandon_confirm=3, bid=4, bid_confirm=5)
+
+        task._attempt_bid(boxes, time.monotonic() + 60)
+
+        self.assertEqual([c for c in task.calls if c[0] == "click"], [])
+        self.assertIn(("read", 7000), task.calls)
+        self.assertIn(("input",), task.calls)
+
+    # --- 出价循环记账 ---
+    def test_stage_bid_loop_does_not_count_abandon_as_successful_bid(self):
+        task = self._make_task()
+        task.current_bid_count = 0
+        attempts = iter([False])
+        outcomes = iter([True])
+        task._attempt_bid = lambda boxes, deadline: next(attempts)
+        task._wait_bid_outcome = lambda boxes, deadline: next(outcomes)
+        task._remaining_timeout = lambda deadline, limit: limit
+
+        task._stage_bid_loop(boxes=None, deadline=time.monotonic() + 60)
+
+        self.assertEqual(task.current_bid_count, 0)
+        self.assertFalse(any("出价成功" in msg for _, msg in task.logs))
+
+    def test_stage_bid_loop_counts_successful_bid(self):
+        task = self._make_task()
+        task.current_bid_count = 0
+        attempts = iter([True])
+        outcomes = iter([True])
+        task._attempt_bid = lambda boxes, deadline: next(attempts)
+        task._wait_bid_outcome = lambda boxes, deadline: next(outcomes)
+        task._remaining_timeout = lambda deadline, limit: limit
+
+        task._stage_bid_loop(boxes=None, deadline=time.monotonic() + 60)
+
+        self.assertEqual(task.current_bid_count, 1)
+        self.assertTrue(any("第 1 次出价成功" in msg for _, msg in task.logs))
+
+    # --- 低保金与价格配置 ---
+    def test_try_claim_welfare_skips_gracefully_when_button_missing(self):
+        """低保金按钮未出现(如当日已领取)只跳过领取, 不得拖垮已成功的拍卖轮次。"""
+        task = self._make_task()
+        task._wait_click_optional = lambda *args, **kwargs: False
+        boxes = SimpleNamespace(welfare_btn=1, claim=2, cancel=3)
+
+        self.assertFalse(task._try_claim_welfare(boxes, None))
+
+    def test_try_claim_welfare_propagates_deadline_expiry(self):
+        task = self._make_task()
+
+        def raise_timeout(*args, **kwargs):
+            raise WaitFailedException("单轮拍卖超时")
+
+        task._wait_click_optional = raise_timeout
+        boxes = SimpleNamespace(welfare_btn=1, claim=2, cancel=3)
+
+        with self.assertRaises(WaitFailedException):
+            task._try_claim_welfare(boxes, time.monotonic() - 1)
+
+    def test_validate_price_config_accepts_valid_values(self):
+        task = self._make_task(**{AutoBidAuctionTask.CONF_FIXED_PRICE: "5000"})
+
+        task._validate_price_config()
+
+    def test_validate_price_config_rejects_non_positive_base_price(self):
+        task = self._make_task(**{AutoBidAuctionTask.CONF_FIXED_PRICE: "-5"})
+
+        with self.assertRaises(ValueError):
+            task._validate_price_config()
+
+    def test_validate_price_config_rejects_unparseable_base_price(self):
+        task = self._make_task(**{AutoBidAuctionTask.CONF_FIXED_PRICE: "1.5"})
+
+        with self.assertRaises(ValueError):
+            task._validate_price_config()
+
+    def test_validate_price_config_rejects_non_finite_raise_value(self):
+        task = self._make_task(
+            **{
+                AutoBidAuctionTask.CONF_FIXED_PRICE: "100",
+                AutoBidAuctionTask.CONF_AUTO_RAISE: True,
+                AutoBidAuctionTask.CONF_RAISE_VALUE: "inf",
+            }
+        )
+
+        with self.assertRaises(ValueError):
+            task._validate_price_config()
 
 
 if __name__ == "__main__":
