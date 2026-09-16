@@ -17,10 +17,16 @@ class SoundTriggerTask(BaseNTETask, TriggerTask):
 
     def run(self):
         context = SoundCombatContext()
+        if not self.sound_config.get("Enable Sound Trigger", True):
+            context.clear_task_if(self)
+            # 传播关闭状态, 让 update_config 停掉音频监听线程
+            self._apply_sound_config(context)
+            return
         if not self.scene.is_in_team(self.is_in_team) or not self.can_sound_trigger():
             context.clear_task_if(self)
             return
         self._apply_sound_config(context)
+        context.update_task(self)
 
     def can_sound_trigger(self):
         allowed = (
@@ -40,14 +46,14 @@ class SoundTriggerTask(BaseNTETask, TriggerTask):
         return current_task in self.executor.onetime_tasks and current_task.running
 
     def _apply_sound_config(self, context: SoundCombatContext):
+        enabled = self.sound_config.get("Enable Sound Trigger", True)
         dodge_all_attacks = self.sound_config.get("Dodge All Attacks", True)
         dodge_thresh = self._clip_threshold(self.sound_config.get("Dodge Threshold"), 0.13)
         counter_thresh = self._clip_threshold(
             self.sound_config.get("Counter Attack Threshold"), 0.12
         )
 
-        context.update_config(True, dodge_all_attacks, dodge_thresh, counter_thresh)
-        context.update_task(self)
+        context.update_config(enabled, dodge_all_attacks, dodge_thresh, counter_thresh)
 
     @staticmethod
     def _clip_threshold(value, default):

@@ -4,9 +4,28 @@ import threading
 from concurrent.futures import Future, InvalidStateError
 from threading import Event
 
-from ok import Logger, get_path_relative_to_exe
+from ok import Logger, get_path_relative_to_exe, og
 
 logger = Logger.get_logger(__name__)
+
+_SOUND_CONFIG_NAME = "Sound Trigger Config"
+_ENABLE_SOUND_TRIGGER_KEY = "Enable Sound Trigger"
+
+
+def _sound_trigger_enabled() -> bool:
+    """Return whether the sound trigger global config is enabled.
+
+    Falls back to True when the config is not readable yet, so early startup
+    or missing config keeps the historic behavior.
+    """
+    global_config = getattr(og, "global_config", None)
+    if global_config is None:
+        return True
+    try:
+        values = global_config.get_config(_SOUND_CONFIG_NAME)
+        return bool(values.get(_ENABLE_SOUND_TRIGGER_KEY, True))
+    except Exception:
+        return True
 
 
 class RuntimeServices:
@@ -98,6 +117,11 @@ class RuntimeServices:
         )
         if self._stop_event.is_set():
             context.shutdown()
+            return
+        if not _sound_trigger_enabled():
+            # Keep the context set up so update_config() can lazily start the
+            # listener later, but skip the WASAPI capture thread entirely.
+            logger.info("Sound trigger disabled by config; audio listener not started")
             return
         if context.enter() and not self._stop_event.is_set():
             logger.info("SoundCombatContext initialized globally")

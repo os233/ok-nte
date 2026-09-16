@@ -347,13 +347,33 @@ class SoundCombatContext:
         dodge_threshold: float,
         counter_threshold: float,
     ):
+        start_listener = False
+        stop_listener = False
         with self._context_lock:
             self._pending_config = (enable, dodge_all_attacks, dodge_threshold, counter_threshold)
             self._enable_sound_trigger = enable
             self._dodge_all_attacks = dodge_all_attacks
-            if self._listener:
-                self._listener.threshold = dodge_threshold
-                self._listener.counter_attack_threshold = counter_threshold
+            listener = self._listener
+            if listener is not None:
+                listener.threshold = dodge_threshold
+                listener.counter_attack_threshold = counter_threshold
+                start_listener = enable and not listener.is_running
+                stop_listener = not enable and listener.is_running
+
+        # start/stop 创建/回收监听线程 (stop 含最长 2s 的 join),
+        # 放在 context 锁外执行, 避免阻塞任务绑定路径
+        if stop_listener:
+            try:
+                listener.stop()
+                logger.info("Sound listener stopped: sound trigger disabled")
+            except Exception:
+                logger.exception("Failed to stop sound listener")
+        elif start_listener:
+            try:
+                if not listener.start():
+                    logger.error("Failed to start sound listener")
+            except Exception:
+                logger.exception("Failed to start sound listener")
 
     def _is_computation_required(self) -> bool:
         if not self._enable_sound_trigger:

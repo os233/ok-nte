@@ -35,13 +35,17 @@ class HeistPath(_HeistPathTaskProxy):
     def sleep(self, timeout):
         """路径专用 sleep。
 
-        大部分时间交给任务 sleep，以便周期检查继续运行；最后一小段用忙等减少
-        录制路线的时间误差。
+        大部分时间交给任务 sleep，以便周期检查继续运行；剩余时间用分段
+        time.sleep 等待, 只保留最后 2ms 忙等以减少录制路线的时间误差。
         """
         target = time.perf_counter() + timeout
         if timeout > 0.02:
             self.task.sleep(timeout - 0.02)
         while True:
-            if time.perf_counter() >= target:
+            remaining = target - time.perf_counter()
+            if remaining <= 0.002:
                 break
+            time.sleep(min(remaining - 0.002, 0.002))
+        while time.perf_counter() < target:
+            pass
         return True
