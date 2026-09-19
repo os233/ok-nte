@@ -1426,3 +1426,8 @@ msgstr "队伍配置"
 
 msgid "不是该角色?"
 msgstr "不是该角色?"
+msgid "待机检查间隔"
+msgstr ""
+
+msgid "未进入战斗时的检查间隔(秒), 调大可降低待机时的 CPU 占用"
+msgstr ""

@@ -1440,3 +1440,8 @@ msgstr "Team configuration"
 
 msgid "不是该角色?"
 msgstr "Wrong character?"
+msgid "待机检查间隔"
+msgstr "Idle Check Interval"
+
+msgid "未进入战斗时的检查间隔(秒), 调大可降低待机时的 CPU 占用"
+msgstr "Check interval in seconds while not in combat. Increase to lower idle CPU usage"

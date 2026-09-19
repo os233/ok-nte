@@ -1172,3 +1172,8 @@ msgstr "Configuração da equipe"
 
 msgid "不是该角色?"
 msgstr "Não é este personagem?"
+msgid "待机检查间隔"
+msgstr "Intervalo de verificação em repouso"
+
+msgid "未进入战斗时的检查间隔(秒), 调大可降低待机时的 CPU 占用"
+msgstr "Intervalo de verificação em segundos fora de combate. Aumente para reduzir a CPU em repouso"
