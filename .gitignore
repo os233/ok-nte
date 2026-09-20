@@ -78,3 +78,9 @@ site/
 !mid_lib/
 mid_lib/*
 !mid_lib/public
+
+# 测试 / 调试临时产物
+tmp*/
+.tmp_qt/
+tests/.tmp/
+.workbuddy-ai/
