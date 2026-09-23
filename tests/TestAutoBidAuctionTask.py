@@ -45,6 +45,12 @@ def _make_task(config: dict | None = None) -> AutoBidAuctionTask:
     task.check_monthly_card = Mock(return_value=False)
     task.handle_monthly_card = Mock()
     task.info_set = Mock()
+    # 贴边阈值按屏幕宽度换算(见 ESTIMATE_EDGE_MARGIN_RATIO), 而框架的 width 属性会一路
+    # 走到 executor.method.width, executor 又读 _executor —— 桩实例没有它, 必须在这里给
+    # 一个默认屏幕宽。需要验证高分辨率行为的用例用
+    # patch.object(AutoBidAuctionTask, "width", property(...)) 自行覆盖
+    # (见 TestAuctionEstimateEdgeMargin)。
+    task._executor = Mock(method=Mock(width=1920))
     # 掉线回场靠基类的 in_world() 判定大世界, 默认不在大世界; 相关用例自行覆盖。
     task.in_world = Mock(return_value=False)
     # 框架的 wait_click_ocr 直接走 click_box, 不会保存和还原鼠标位置,
@@ -2137,6 +2143,41 @@ class TestAuctionEstimateLabelAnchor(unittest.TestCase):
 
         self.assertIsNone(task._read_estimate_value(Mock(), 1)[0])
 
+    def test_estimate_box_right_edge_leaves_the_asset_number_outside(self):
+        """BOX_ESTIMATE 右边界必须落在「我的资产」数值左边, 不能覆盖它。
+
+        回归 coderabbit 审查: 右边界原本是 0.9700, 而「我的资产」数值右端实测在 0.9594,
+        即裁框把资产数字圈了进来。标签一旦漏读(OCR 抖动、界面过渡帧), 区域内就剩两个数字,
+        `_read_estimate_value` 的按标签过滤会退化成拼接整段数字 —— 拼接结果可能恰好满足
+        千位规则而逃过残缺校验, 直接进 `_estimate_bid_price` 变成一次错误出价。
+        把右边界收到 0.9200 后, 即使标签漏读, 区域里也只剩估价一个数字。
+        """
+        left, _, right, _ = AutoBidAuctionTask.BOX_ESTIMATE
+        # 实测数字: 估价右端最靠右 0.9052, 我的资产右端 0.9594。
+        estimate_right_edge = 0.9052
+        asset_left_edge = 0.9594
+
+        self.assertGreater(right, estimate_right_edge, "右边界必须留出估价末位的余量")
+        self.assertLess(right, asset_left_edge, "右边界不能伸进我的资产数值")
+
+    def test_only_the_estimate_survives_when_the_label_is_missed(self):
+        """标签漏读时, 收窄后的裁框里只剩估价一个数字, 拼接退化成单值而非粘成两串。"""
+        left, top, right, _ = AutoBidAuctionTask.BOX_ESTIMATE
+        screen_width = 1920
+        box_left = round(left * screen_width)
+        box_right = round(right * screen_width)
+
+        # 按实测比例摆放两个数字: 估价右端 0.9052, 资产左端在 0.9594 之外。
+        estimate_box = self._text_box("2,643", round(0.8438 * screen_width), 100)
+        asset_box = self._text_box("22,684", round(0.9600 * screen_width), 90)
+        # 裁框只保留落在区域内的框 —— 这是 openvino_detector 建框后的实际效果。
+        visible = [b for b in (estimate_box, asset_box) if b.x < box_right]
+
+        self.assertEqual([b.name for b in visible], ["2,643"])
+        self.assertLess(box_right, asset_box.x)
+        self.assertGreater(box_left, 0)
+        self.assertGreaterEqual(top, 0)
+
     def test_number_touching_the_right_edge_is_flagged(self):
         """数字右端贴住裁框边界说明末位可能被切掉, 用贴边标志暴露给调用方。"""
         box = Mock(x=1850, y=140, width=350, height=60)
@@ -2456,6 +2497,7 @@ class TestAuctionWorldDropRecovery(unittest.TestCase):
     def test_stage_match_recovers_when_world_detected_before_timeout(self):
         """空转到超时前检测到大世界时走回场, 而不是抛「匹配阶段超时」。"""
         task = self._task(world=True)
+        task._recover_quota = AutoBidAuctionTask.RECOVER_MAX_PER_ROUND
         task._recover_from_world = Mock(return_value=AuctionState.BID)
 
         result = task._stage_match(Mock(), self.clock.now)
@@ -2463,8 +2505,8 @@ class TestAuctionWorldDropRecovery(unittest.TestCase):
         self.assertEqual(result, AuctionState.BID)
         task._recover_from_world.assert_called_once()
 
-    def test_recover_reruns_match_without_recover_flag(self):
-        """回场成功后重跑匹配阶段, 且重跑时禁止再次回场。"""
+    def test_recover_reruns_match(self):
+        """回场成功后重跑匹配阶段, 把本轮接着走完。"""
         task = self._task()
         task._return_to_auction = Mock(return_value=True)
         task._read_current_venue = Mock(return_value="当前：海贝场")
@@ -2473,7 +2515,9 @@ class TestAuctionWorldDropRecovery(unittest.TestCase):
         result = task._recover_from_world(Mock(), self.clock.now + 600)
 
         self.assertEqual(result, AuctionState.CONFIRM)
-        self.assertFalse(task._stage_match.call_args.kwargs["allow_recover"])
+        task._stage_match.assert_called_once()
+        # 重跑走的是同一份轮次 deadline, 不会另开预算。
+        self.assertEqual(task._stage_match.call_args.args[1], self.clock.now + 600)
 
     def test_recover_raises_when_return_to_auction_fails(self):
         task = self._task()
@@ -2485,15 +2529,65 @@ class TestAuctionWorldDropRecovery(unittest.TestCase):
         self.assertIn("未能回到拍卖界面", str(ctx.exception))
 
     def test_second_drop_fails_round_instead_of_recovering_again(self):
-        """回场后再次掉线时按本轮失败结束, 不能无限回场。"""
+        """配额用完后再次掉线按本轮失败结束, 不能无限回场。"""
         task = self._task()
+        task._recover_quota = 0
         task._recover_from_world = Mock()
 
         with self.assertRaises(WaitFailedException) as ctx:
-            task._resume_after_world_drop(Mock(), self.clock.now, False)
+            task._resume_after_world_drop(Mock(), self.clock.now)
 
         self.assertIn("再次掉线", str(ctx.exception))
         task._recover_from_world.assert_not_called()
+
+    def test_each_recover_consumes_the_round_quota(self):
+        """回场一次就扣一次配额, 配额用完后再掉线直接判本轮失败。"""
+        task = self._task()
+        task._recover_quota = 1
+        task._recover_from_world = Mock(return_value=AuctionState.BID)
+
+        self.assertEqual(
+            task._resume_after_world_drop(Mock(), self.clock.now), AuctionState.BID
+        )
+        self.assertEqual(task._recover_quota, 0)
+
+        with self.assertRaises(WaitFailedException):
+            task._resume_after_world_drop(Mock(), self.clock.now)
+        self.assertEqual(task._recover_from_world.call_count, 1)
+
+    def test_confirm_failure_rerun_shares_the_same_quota(self):
+        """确认失败后重跑匹配阶段时, 不能把本轮回场配额重置回去。
+
+        回归 coderabbit 审查: 原实现把「能否回场」放在 `allow_recover` 参数上逐层传递,
+        而 `_ensure_confirm_stage` 的确认失败分支重新调 `_stage_match(boxes, deadline)`,
+        默认值 `True` 会把配额悄悄恢复 —— 于是一轮里可以回场多次, 每次都重走一遍
+        「F5 → 都市闲趣 → 即刻落槌」的面板动画, 把整轮 deadline 耗光。
+
+        这里直接盯住配额: 第一次匹配时消耗掉本轮回场配额, 之后确认失败触发重跑,
+        重跑进 `_stage_match` 时配额必须已经是 0, 而不是被恢复成 RECOVER_MAX_PER_ROUND。
+        """
+        task = self._task()
+        task._stage_confirm = Mock(return_value=False)
+        seen_quota: list[int] = []
+
+        def stage_match(boxes, deadline):
+            seen_quota.append(task._recover_quota)
+            if len(seen_quota) == 1:
+                # 第一次匹配: 模拟掉线回场, 把本轮配额用掉。
+                task._recover_quota -= 1
+                return AuctionState.CONFIRM
+            # 确认失败后的重跑: 从此处抛出让整轮提前结束, 只看配额够了。
+            raise WaitFailedException("重跑: 测试到此为止")
+
+        task._stage_match = Mock(side_effect=stage_match)
+
+        with self.assertRaises(WaitFailedException) as ctx:
+            task._exec_auction_round(Mock())
+
+        self.assertIn("重跑", str(ctx.exception))
+        self.assertEqual(seen_quota[0], AutoBidAuctionTask.RECOVER_MAX_PER_ROUND)
+        # 关键断言: 重跑时配额没有被恢复, 否则同一轮又能再回场一次。
+        self.assertEqual(seen_quota[1], 0)
 
     def test_return_to_auction_walks_f5_city_fun_and_card(self):
         """回场顺序: 大世界 → F5 都市大亨 → 都市闲趣 → 即刻落槌 → 主界面标题。"""
@@ -2569,6 +2663,155 @@ class TestAuctionWorldDropRecovery(unittest.TestCase):
         task.ocr = Mock(side_effect=RuntimeError("no frame"))
 
         self.assertEqual(task._read_current_venue(), "")
+
+
+class TestAuctionReturnBudget(unittest.TestCase):
+    """回场的每一步都必须受「剩余预算」约束, 不能走各处的默认超时。
+
+    `ensure_main` 默认 `time_out` 是 30 秒, 但登录态丢失时会被抬到 600 秒
+    (见 `BaseNTETask.ensure_main`)。`RECOVER_TIMEOUT` 只有 90 秒, 不把剩余时间传进去,
+    单是这一步就能把整个回场预算连同本轮 deadline 一起耗光 —— 后面的 F5、「都市闲趣」
+    入口、「即刻落槌」根本轮不到执行, 而日志只会显示回场失败。
+    """
+
+    def setUp(self):
+        self.clock = _FakeTime()
+        patcher = patch.object(auction_module, "time", self.clock)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _task(self) -> AutoBidAuctionTask:
+        task = _make_task()
+        task.sleep = Mock(side_effect=self.clock.sleep)
+        task.ensure_main = Mock()
+        task.openF5panel = Mock()
+        task.operate_click = Mock()
+        task._click_instant_lot = Mock(return_value=True)
+        return task
+
+    def test_ensure_main_receives_the_remaining_budget(self):
+        """预算只剩多少, ensure_main 就最多等多少。"""
+        task = self._task()
+        # 回场整体成功, 让流程走到最后一步。
+        task.wait_ocr = Mock(return_value=[Mock()])
+        deadline = self.clock.now + 20
+
+        task._return_to_auction(Mock(), deadline)
+
+        self.assertTrue(task.ensure_main.called)
+        leftover = task.ensure_main.call_args.kwargs["time_out"]
+        self.assertLessEqual(leftover, 20)
+        self.assertGreater(leftover, 0)
+
+    def test_budget_exhausted_skips_the_rest_of_the_path(self):
+        """预算耗尽时不再去动 F5 和面板 —— 那些步骤只会继续超时。"""
+        task = self._task()
+        task.wait_ocr = Mock(return_value=[Mock()])
+        deadline = self.clock.now - 1  # 已经过期
+
+        self.assertFalse(task._return_to_auction(Mock(), deadline))
+        task.ensure_main.assert_not_called()
+        task.openF5panel.assert_not_called()
+
+    def test_retry_reset_also_respects_the_budget(self):
+        """重试前的复位走的是同一份预算, 不能再用默认超时把预算吃干净。"""
+        task = self._task()
+        seen = []
+
+        def fail_once(*args, **kwargs):
+            seen.append(kwargs.get("time_out"))
+            raise RuntimeError("模拟打开面板失败")
+
+        task.wait_ocr = Mock(return_value=[Mock()])
+        task.ensure_main = Mock(side_effect=fail_once)
+        deadline = self.clock.now + 30
+
+        task._return_to_auction(Mock(), deadline)
+
+        # action 与 reset 各调一次, 且两次都带上了不超过剩余预算的 time_out。
+        self.assertEqual(len(seen), 2)
+        for time_out in seen:
+            self.assertIsNotNone(time_out)
+            self.assertLessEqual(time_out, 30)
+            self.assertGreater(time_out, 0)
+
+
+class TestAuctionEstimateEdgeMarginScaling(unittest.TestCase):
+    """估价贴边阈值必须随分辨率等比放大, 不能是固定像素。
+
+    AGENTS.md 要求坐标用相对屏幕比例, 支持 1080p/1440p/2160p。贴边阈值原本硬编码 8px,
+    那是 1080p 下的实测临界值; 高分辨率下 UI 与文字同步放大, 同一形态的末位残边也等比
+    变宽 (2160p 下约 16px), 固定 8px 会漏判 —— 被裁的读数会被当成正常值采信, 正是
+    2026-09-23 那次「2,643 读成 ,643」的同类故障。
+    """
+
+    BOX_RIGHT = 2200
+    # 真实布局里「当前估价：」标签在数字左侧。
+    LABEL_X = 1900
+
+    @staticmethod
+    def _text_box(name: str, x: int, width: int, y: int = 150, height: int = 40) -> Mock:
+        box = Mock()
+        box.name = name
+        box.x = x
+        box.y = y
+        box.width = width
+        box.height = height
+        return box
+
+    def _read(self, screen_width: int, digit_right_offset: int) -> tuple[int | None, bool]:
+        """数字右端距裁框右边界 digit_right_offset 像素时的 (值, 是否贴边)。"""
+        task = _make_task()
+        task.ocr = Mock(
+            return_value=[
+                self._text_box("当前估价：", self.LABEL_X, 130),
+                self._text_box("1,912", self.BOX_RIGHT - digit_right_offset - 90, 90),
+            ]
+        )
+        with patch.object(AutoBidAuctionTask, "width", property(lambda self: screen_width)):
+            return task._read_estimate_value(
+                Mock(x=self.BOX_RIGHT - 350, y=140, width=350, height=60), 1.0
+            )
+
+    def test_margin_follows_screen_width(self):
+        """阈值随屏幕宽度等比放大, 且至少 1px。"""
+        ratio = AutoBidAuctionTask.ESTIMATE_EDGE_MARGIN_RATIO
+
+        self.assertEqual(max(1, round(1920 * ratio)), 8)
+        self.assertEqual(max(1, round(2560 * ratio)), 11)
+        self.assertEqual(max(1, round(3840 * ratio)), 16)
+
+    def test_1080p_known_failure_shape_is_tight(self):
+        """1080p 下末位只剩 4px 竖边 —— 这是实际发生过的故障形态, 必须判贴边。"""
+        _, tight = self._read(1920, 4)
+
+        self.assertTrue(tight)
+
+    def test_same_shape_scales_and_stays_tight_at_higher_resolution(self):
+        """同一故障形态在 1440p/2160p 下残边同比变宽, 固定 8px 会漏判。"""
+        ratio = AutoBidAuctionTask.ESTIMATE_EDGE_MARGIN_RATIO
+
+        for width in (2560, 3840):
+            with self.subTest(width=width):
+                # 按 1080p 的 4px 等比换算出的残边宽度。
+                offset = round(4 * width / 1920)
+                expected_margin = max(1, round(width * ratio))
+
+                self.assertGreater(expected_margin, 8)  # 固定阈值确实不够用
+                _, tight = self._read(width, offset)
+
+                self.assertTrue(tight)
+
+    def test_read_is_not_flagged_when_far_from_the_edge(self):
+        """离边界足够远时不报贴边, 正常读数继续被采信。"""
+        ratio = AutoBidAuctionTask.ESTIMATE_EDGE_MARGIN_RATIO
+
+        for width in (1920, 2560, 3840):
+            with self.subTest(width=width):
+                value, tight = self._read(width, max(1, round(width * ratio)) + 3)
+
+                self.assertFalse(tight)
+                self.assertEqual(value, 1912)
 
 
 class TestAuctionBidModeConfigVisibility(unittest.TestCase):
