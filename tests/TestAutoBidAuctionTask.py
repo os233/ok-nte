@@ -44,6 +44,9 @@ def _make_task(config: dict | None = None) -> AutoBidAuctionTask:
     task.find_monthly_card = Mock(return_value=None)
     task.check_monthly_card = Mock(return_value=False)
     task.handle_monthly_card = Mock()
+    task.info_set = Mock()
+    # 掉线回场靠基类的 in_world() 判定大世界, 默认不在大世界; 相关用例自行覆盖。
+    task.in_world = Mock(return_value=False)
     # 框架的 wait_click_ocr 直接走 click_box, 不会保存和还原鼠标位置,
     # 后台执行时会把用户的鼠标留在游戏窗口内; 任务内任何调用都视为回归。
     task.wait_click_ocr = Mock(side_effect=AssertionError("不应使用 wait_click_ocr"))
@@ -52,6 +55,10 @@ def _make_task(config: dict | None = None) -> AutoBidAuctionTask:
     task._post_round_state = PostRoundState()
     task._sell_failures = 0
     task._inventory_stuck = False
+    # 资产历史落盘器: 默认替换成不落盘的内存桩, 避免测试往仓库写 data/asset_history.jsonl。
+    # 需要断言写入行为的用例自行覆盖成真实记录器(见 TestAssetHistory)。
+    task._asset_history = Mock()
+    task._asset_history.record = Mock(return_value=None)
     return task
 
 
@@ -648,7 +655,7 @@ class TestAuctionBidMode(unittest.TestCase):
                 AutoBidAuctionTask.CONF_FIXED_PRICE: 1,
             }
         )
-        task._read_asset_value = Mock(return_value=35301)
+        task._read_estimate_value = Mock(return_value=(35301, False))
 
         self.assertEqual(task._calculate_auction_price(Mock(), None), 52952)
 
@@ -661,7 +668,7 @@ class TestAuctionBidMode(unittest.TestCase):
                 AutoBidAuctionTask.CONF_FIXED_PRICE: 777,
             }
         )
-        task._read_asset_value = Mock(return_value=None)
+        task._read_estimate_value = Mock(return_value=(None, False))
         # 稳定读取会重试到 ESTIMATE_STABLE_TIMEOUT, 用假时钟避免测试真的等 10 秒。
         clock = _FakeTime()
         task.sleep = Mock(side_effect=clock.sleep)
@@ -1822,7 +1829,11 @@ class TestAuctionEstimateStableRead(unittest.TestCase):
         task = _make_task()
         task.sleep = Mock(side_effect=self.clock.sleep)
         # 读数序列用完后一直重复最后一个值, 模拟"跳完就稳定"。
-        task._read_asset_value = Mock(side_effect=list(values) + [list(values)[-1]] * 20)
+        # 桩点打在 _read_estimate_value 上: _read_stable_asset_value 现在通过它读值,
+        # 返回值是 (值, 是否贴边) 二元组。这里统一给不贴边。
+        task._read_estimate_value = Mock(
+            side_effect=[(v, False) for v in list(values) + [list(values)[-1]] * 20]
+        )
         return task
 
     def test_returns_only_after_consecutive_identical_reads(self):
@@ -1830,7 +1841,7 @@ class TestAuctionEstimateStableRead(unittest.TestCase):
 
         self.assertEqual(task._read_stable_asset_value(Mock(), 10, "当前估价"), 300)
         # 300 连续 3 次相同之后还要满足最短观察窗口, 所以读取次数多于 5 次。
-        self.assertGreaterEqual(task._read_asset_value.call_count, 5)
+        self.assertGreaterEqual(task._read_estimate_value.call_count, 5)
 
     def test_jumping_value_is_not_used_early(self):
         """跳动中的中间值不能被采用, 否则会按错误的估价出价。"""
@@ -1847,7 +1858,7 @@ class TestAuctionEstimateStableRead(unittest.TestCase):
         task._read_stable_asset_value(Mock(), 10, "当前估价")
 
         # 每次重读前都要换帧, 采用的那一次不再换帧。
-        self.assertEqual(task.next_frame.call_count, task._read_asset_value.call_count - 1)
+        self.assertEqual(task.next_frame.call_count, task._read_estimate_value.call_count - 1)
 
     def test_value_is_not_used_before_the_minimum_observe_window(self):
         """中间值会稳定停留到面板打开后 2.6 秒, 观察窗口不够长就会采信它。
@@ -1891,6 +1902,18 @@ class TestAuctionEstimateStableRead(unittest.TestCase):
         self.assertFalse(AutoBidAuctionTask._is_partial_number_text("5,734"))
         self.assertFalse(AutoBidAuctionTask._is_partial_number_text("486"))
 
+    def test_inconsistent_grouping_is_detected(self):
+        """逗号位置不合千位规则说明 OCR 丢了或多读了字符。
+
+        拦不住无逗号的 `643`(天然自洽), 所以它只是辅助防线, 主要防线是贴边告警。
+        """
+        self.assertTrue(AutoBidAuctionTask._has_inconsistent_grouping("1,23"))
+        self.assertTrue(AutoBidAuctionTask._has_inconsistent_grouping("12,3,456"))
+        self.assertFalse(AutoBidAuctionTask._has_inconsistent_grouping("1,234"))
+        self.assertFalse(AutoBidAuctionTask._has_inconsistent_grouping("22,684"))
+        self.assertFalse(AutoBidAuctionTask._has_inconsistent_grouping("643"))
+        self.assertFalse(AutoBidAuctionTask._has_inconsistent_grouping(",643"))
+
     def test_read_asset_value_drops_partial_estimate_text(self):
         """估价区域读到残缺文本时按未读出处理, 交给上层重读; 稳定的数字区域保持原行为。"""
         task = _make_task()
@@ -1905,20 +1928,20 @@ class TestAuctionEstimateStableRead(unittest.TestCase):
         """一直跳动时不能回退成基础价, 最后一次读数比丢弃更接近真实值。"""
         task = _make_task()
         task.sleep = Mock(side_effect=self.clock.sleep)
-        task._read_asset_value = Mock(
-            side_effect=lambda *a, **k: task._read_asset_value.call_count * 100
+        task._read_estimate_value = Mock(
+            side_effect=lambda *a, **k: (task._read_estimate_value.call_count * 100, False)
         )
 
         value = task._read_stable_asset_value(Mock(), 5, "当前估价")
 
-        self.assertEqual(value, task._read_asset_value.call_count * 100)
-        self.assertGreater(task._read_asset_value.call_count, 1)
+        self.assertEqual(value, task._read_estimate_value.call_count * 100)
+        self.assertGreater(task._read_estimate_value.call_count, 1)
         task.log_warning.assert_called()
 
     def test_returns_none_without_warning_when_never_readable(self):
         task = _make_task()
         task.sleep = Mock(side_effect=self.clock.sleep)
-        task._read_asset_value = Mock(return_value=None)
+        task._read_estimate_value = Mock(return_value=(None, False))
 
         self.assertIsNone(task._read_stable_asset_value(Mock(), 5, "当前估价"))
         task.log_warning.assert_not_called()
@@ -1934,7 +1957,7 @@ class TestAuctionEstimateStableRead(unittest.TestCase):
         value = task._read_stable_asset_value(Mock(), 10, "当前估价", skip_zero=True)
 
         self.assertEqual(value, 35301)
-        self.assertGreater(task._read_asset_value.call_count, 3)
+        self.assertGreater(task._read_estimate_value.call_count, 3)
 
     def test_zero_does_not_reset_the_stability_counter(self):
         """中间夹一次 0 不应把已经攒够的连续次数清零, 否则真值永远攒不满。"""
@@ -1954,6 +1977,216 @@ class TestAuctionEstimateStableRead(unittest.TestCase):
 
         self.assertIsNone(task._read_stable_asset_value(Mock(), 5, "当前估价", skip_zero=True))
         task.log_warning.assert_called()
+
+    def _task_with_tight(self, reads) -> AutoBidAuctionTask:
+        """reads 为 (值, 是否贴边) 序列, 用完后一直重复最后一帧。"""
+        task = _make_task()
+        task.sleep = Mock(side_effect=self.clock.sleep)
+        task._read_estimate_value = Mock(
+            side_effect=list(reads) + [list(reads)[-1]] * 40
+        )
+        return task
+
+    def test_tight_reads_do_not_accumulate_the_stability_counter(self):
+        """贴边帧不能被当成「没有新信息」来累积稳定计数。
+
+        回归: 贴边帧原本走 `if value is None: same += 1` 分支, 于是「先读到一次正常值 +
+        随后连续贴边」会被攒成 stable 并返回那个旧值 —— 而旧值正是在裁框不够用的帧上读的,
+        可信度不该随贴边次数的增加而上升。更糟的是 tight_seen 的告警只在 last is None
+        时才走, 贴边信号被静默吞掉 (2026-09-23 审查发现)。
+        """
+        task = self._task_with_tight([(26643, False)] + [(2643, True)] * 8)
+
+        value = task._read_stable_asset_value(Mock(), 5, "当前估价")
+
+        # 不得把它当成「读数稳定」返回; 允许走超时兜底, 但必须有贴边告警。
+        self.assertFalse(
+            any("读数稳定" in str(c.args[0]) for c in task.log_info.call_args_list)
+        )
+        self.assertTrue(
+            any("贴住识别区域边界" in str(c.args[0]) for c in task.log_warning.call_args_list)
+        )
+        self.assertNotEqual(value, 2643)
+
+    def test_all_tight_reads_return_none_with_edge_warning(self):
+        """全程贴边说明末位可能一直是被裁的, 按未读出处理并指向裁框常量。"""
+        task = self._task_with_tight([(2643, True)] * 10)
+
+        self.assertIsNone(task._read_stable_asset_value(Mock(), 5, "当前估价"))
+        self.assertTrue(
+            any(
+                "BOX_ESTIMATE 右边界" in str(c.args[0])
+                for c in task.log_warning.call_args_list
+            )
+        )
+
+    def test_recovery_after_a_transient_tight_read(self):
+        """贴边可能只是数字滚动中的瞬时抖动, 之后的正常读数必须能正常稳定下来。"""
+        task = self._task_with_tight([(197, True)] + [(300, False)] * 8)
+
+        self.assertEqual(task._read_stable_asset_value(Mock(), 10, "当前估价"), 300)
+
+    def test_value_read_after_tight_reads_is_adopted(self):
+        """贴边作废旧值之后读到的新值应当被采用, 不能一直卡在旧值上。"""
+        task = self._task_with_tight(
+            [(26643, False), (2643, True), (2643, True)] + [(25000, False)] * 8
+        )
+
+        self.assertEqual(task._read_stable_asset_value(Mock(), 10, "当前估价"), 25000)
+
+
+class TestAuctionEstimateLabelAnchor(unittest.TestCase):
+    """估价数字必须按「估价」标签右边沿取, 不能只靠裁框宽度。
+
+    线上证据 2026-09-23: 区域里有多个文本时直接 `"".join()` 会把两串数字粘成一个。
+    BOX_ESTIMATE 右边界落进「我的资产」数值里时, 资产数字被截尾后与估价粘成一串,
+    表现成「估价少一位」(2,643 读成 ,643 / 1,912 读成 912)。
+
+    另一个坑(2026-09-23 21:49 线上炸过一次): 取文本必须用 `self.ocr(match=None)`,
+    不能用 `wait_ocr(match=RE_NUMBER)` —— 框架会用 match **过滤返回值**, 标签框不在里面,
+    于是 `label_right` 永远是 None、估价永远读不出。这里桩的就是 `task.ocr`。
+    """
+
+    @staticmethod
+    def _text_box(name: str, x: int, width: int, y: int = 150, height: int = 40) -> Mock:
+        box = Mock()
+        box.name = name
+        box.x = x
+        box.y = y
+        box.width = width
+        box.height = height
+        return box
+
+    def _task(self, boxes) -> AutoBidAuctionTask:
+        task = _make_task()
+        task.ocr = Mock(return_value=boxes)
+        return task
+
+    def test_reads_all_texts_not_only_number_matches(self):
+        """必须读到标签框: 它不匹配 RE_NUMBER, 但正是定位数字的依据。
+
+        回归 2026-09-23 21:49 的线上故障 —— 那时用 wait_ocr(match=RE_NUMBER), 框架把返回
+        列表过滤成只含数字, 标签丢失, 每一帧都判「标签未读到」, 出价一直回退基础价 1。
+        """
+        task = self._task(
+            [
+                self._text_box("当前估价：", 1502, 118, y=149, height=34),
+                self._text_box("13,875", 1640, 90, y=153, height=28),
+            ]
+        )
+
+        value, tight = task._read_estimate_value(Mock(x=1493, y=143, width=369, height=53), 1)
+
+        self.assertEqual(value, 13875)
+        self.assertFalse(tight)
+        # 必须是不带 match 的调用, 否则框架会再把标签过滤掉。
+        self.assertIsNone(task.ocr.call_args.kwargs.get("match"))
+
+    def test_takes_number_right_of_the_label(self):
+        """标签右边的数字才是估价; 标签左边残留的数字要被排除。"""
+        task = self._task(
+            [
+                self._text_box("当前估价：", 1900, 130),
+                self._text_box("2,643", 2060, 120),
+            ]
+        )
+
+        value, tight = task._read_estimate_value(Mock(x=1850, y=140, width=450, height=60), 1)
+
+        self.assertEqual(value, 2643)
+        self.assertFalse(tight)
+
+    def test_asset_number_to_the_right_is_not_glued_in(self):
+        """同一裁框里出现第二个数字栏时, 拼接结果会被判为残缺读数而不是当成估价。
+
+        这是本次线上故障的形态: `RE_NUMBER` 把区域内所有命中文本 `"".join()` 拼接, 估价的
+        右边界一旦伸进「我的资产」数值, 两串数字就粘成 `2,64322,684`。这类读数分组不自洽,
+        会被 `_has_inconsistent_grouping` 拦下, 按未读出处理 —— 交给调用方重读一帧, 而不是
+        按错误价格出价。真正让裁框内只剩估价一个数字的是 BOX_ESTIMATE 的右边界(见该常量注释)。
+        """
+        task = self._task(
+            [
+                self._text_box("当前估价：", 1900, 130),
+                self._text_box("2,643", 2060, 120),
+                self._text_box("22,684", 2450, 100),
+            ]
+        )
+
+        value, _ = task._read_estimate_value(Mock(x=1850, y=140, width=800, height=60), 1)
+
+        self.assertIsNone(value)
+        # 必须是因为「分组不自洽」被拒, 而不是因为标签没读到之类的原因。
+        self.assertTrue(
+            any("不自洽" in str(c.args[0]) for c in task.log_debug.call_args_list)
+        )
+
+    def test_partial_text_right_of_the_label_is_rejected(self):
+        """标签右边读到 `,643` 说明首位被裁, 按未读出处理。"""
+        task = self._task(
+            [
+                self._text_box("当前估价：", 1900, 130),
+                self._text_box(",643", 2060, 90),
+            ]
+        )
+
+        self.assertIsNone(task._read_estimate_value(Mock(), 1)[0])
+
+    def test_label_missing_gives_no_value(self):
+        """标签没读出来时不猜数字, 交给调用方重读一帧。"""
+        task = self._task([self._text_box("2,643", 2060, 120)])
+
+        self.assertIsNone(task._read_estimate_value(Mock(), 1)[0])
+
+    def test_number_touching_the_right_edge_is_flagged(self):
+        """数字右端贴住裁框边界说明末位可能被切掉, 用贴边标志暴露给调用方。"""
+        box = Mock(x=1850, y=140, width=350, height=60)
+        task = self._task(
+            [
+                self._text_box("当前估价：", 1900, 130),
+                # 右端 2196 距裁框右边界 2200 只剩 4px。
+                self._text_box("2,643", 2060, 136),
+            ]
+        )
+
+        value, tight = task._read_estimate_value(box, 1)
+
+        self.assertEqual(value, 2643)
+        self.assertTrue(tight)
+
+
+class TestAuctionKeypadScreenDetection(unittest.TestCase):
+    """数字键盘弹出后是第三套界面状态, 必须能认出它, 否则空等到超时。
+
+    键盘弹窗整体覆盖约 0.30~0.90 / 0.44~0.80, 盖住 BOX_BID, 那时 BOX_BID 的 all_boxes
+    是空的, 用 RE_BID 判定会永远为假。线上 2026-09-23 18:44 因此空转 60 秒报
+    「等待出价界面超时」。
+    """
+
+    def _task(self, hit_keypad: bool, hit_bid: bool) -> AutoBidAuctionTask:
+        task = _make_task()
+        task.ocr = Mock(side_effect=[hit_keypad, hit_bid])
+        return task
+
+    def test_keypad_markup_is_recognized_as_bid_screen(self):
+        task = self._task(hit_keypad=True, hit_bid=False)
+        boxes = Mock(bid_keypad=Mock(), bid=Mock())
+
+        self.assertTrue(task._is_bid_screen(boxes))
+
+    def test_bid_button_still_works_without_keypad(self):
+        task = self._task(hit_keypad=False, hit_bid=True)
+        boxes = Mock(bid_keypad=Mock(), bid=Mock())
+
+        self.assertTrue(task._is_bid_screen(boxes))
+
+    def test_keypad_is_checked_before_the_bid_button(self):
+        """键盘态是更具体的形态, 命中就不必再读 BOX_BID(那个区域此时是空的)。"""
+        task = self._task(hit_keypad=True, hit_bid=False)
+        boxes = Mock(bid_keypad=Mock(), bid=Mock())
+
+        task._is_bid_screen(boxes)
+
+        self.assertEqual(task.ocr.call_count, 1)
 
 
 class TestAuctionEstimateBidPrice(unittest.TestCase):
@@ -2161,6 +2394,181 @@ class TestAuctionMatchClickProbe(unittest.TestCase):
 
         self.assertIn("匹配阶段", str(ctx.exception))
         self.assertNotIn("单轮拍卖超时", str(ctx.exception))
+
+
+class TestAuctionWorldDropRecovery(unittest.TestCase):
+    """掉线被踢回大世界后自动回场。
+
+    网络不稳时点「开始匹配」后会被踢回大世界, 拍卖界面的四种状态判定全不命中, 原逻辑
+    每轮空转到 MATCH_TIMEOUT(120 秒) 才按本轮失败处理。这里覆盖掉线检测、回场路径
+    与「只回场一次」的边界。
+    """
+
+    def setUp(self):
+        self.clock = _FakeTime()
+        patcher = patch.object(auction_module, "time", self.clock)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _task(self, *, world: bool = False, match: bool = False) -> AutoBidAuctionTask:
+        task = _make_task()
+        task.in_world = Mock(return_value=world)
+        task._is_match_screen = Mock(return_value=match)
+        task._is_confirm_screen = Mock(return_value=False)
+        task._is_bid_screen = Mock(return_value=False)
+        task._is_skip_screen = Mock(return_value=False)
+        task._wait_operate_click = Mock(return_value=True)
+        task.sleep = Mock(side_effect=self.clock.sleep)
+        return task
+
+    def test_world_screen_forwards_to_in_world(self):
+        task = self._task(world=True)
+
+        self.assertTrue(task._is_world_screen())
+        task.in_world.assert_called_once()
+
+    def test_world_screen_swallows_detection_errors(self):
+        """大世界判定依赖模板匹配, 判定失败不能打断拍卖主流程。"""
+        task = self._task()
+        task.in_world = Mock(side_effect=RuntimeError("no frame"))
+
+        self.assertFalse(task._is_world_screen())
+
+    def test_match_click_reports_world_instead_of_loading_forever(self):
+        """按钮已消失却没进后续界面, 且检测到大世界时判定为掉线。"""
+        task = self._task(match=False, world=True)
+        started = self.clock.now
+
+        self.assertEqual(
+            task._handle_match_click(Mock(), self.clock.now + 120), AuctionState.WORLD
+        )
+        self.assertLess(self.clock.now - started, AutoBidAuctionTask.MATCH_CLICK_TIMEOUT)
+
+    def test_match_click_keeps_waiting_when_not_in_world(self):
+        """不在大世界时仍要等满 MATCH_CLICK_TIMEOUT, 不能把加载动画当成掉线。"""
+        task = self._task(match=False, world=False)
+        started = self.clock.now
+
+        self.assertIsNone(task._handle_match_click(Mock(), self.clock.now + 120))
+
+        self.assertGreaterEqual(self.clock.now - started, AutoBidAuctionTask.MATCH_CLICK_TIMEOUT)
+
+    def test_stage_match_recovers_when_world_detected_before_timeout(self):
+        """空转到超时前检测到大世界时走回场, 而不是抛「匹配阶段超时」。"""
+        task = self._task(world=True)
+        task._recover_from_world = Mock(return_value=AuctionState.BID)
+
+        result = task._stage_match(Mock(), self.clock.now)
+
+        self.assertEqual(result, AuctionState.BID)
+        task._recover_from_world.assert_called_once()
+
+    def test_recover_reruns_match_without_recover_flag(self):
+        """回场成功后重跑匹配阶段, 且重跑时禁止再次回场。"""
+        task = self._task()
+        task._return_to_auction = Mock(return_value=True)
+        task._read_current_venue = Mock(return_value="当前：海贝场")
+        task._stage_match = Mock(return_value=AuctionState.CONFIRM)
+
+        result = task._recover_from_world(Mock(), self.clock.now + 600)
+
+        self.assertEqual(result, AuctionState.CONFIRM)
+        self.assertFalse(task._stage_match.call_args.kwargs["allow_recover"])
+
+    def test_recover_raises_when_return_to_auction_fails(self):
+        task = self._task()
+        task._return_to_auction = Mock(return_value=False)
+
+        with self.assertRaises(WaitFailedException) as ctx:
+            task._recover_from_world(Mock(), self.clock.now + 600)
+
+        self.assertIn("未能回到拍卖界面", str(ctx.exception))
+
+    def test_second_drop_fails_round_instead_of_recovering_again(self):
+        """回场后再次掉线时按本轮失败结束, 不能无限回场。"""
+        task = self._task()
+        task._recover_from_world = Mock()
+
+        with self.assertRaises(WaitFailedException) as ctx:
+            task._resume_after_world_drop(Mock(), self.clock.now, False)
+
+        self.assertIn("再次掉线", str(ctx.exception))
+        task._recover_from_world.assert_not_called()
+
+    def test_return_to_auction_walks_f5_city_fun_and_card(self):
+        """回场顺序: 大世界 → F5 都市大亨 → 都市闲趣 → 即刻落槌 → 主界面标题。"""
+        task = self._task()
+        task.ensure_main = Mock()
+        task.openF5panel = Mock()
+        task.wait_ocr = Mock(return_value=[Mock()])
+        task._click_instant_lot = Mock(return_value=True)
+
+        self.assertTrue(task._return_to_auction(Mock(), self.clock.now + 90))
+
+        task.ensure_main.assert_called()
+        task.openF5panel.assert_called_once()
+        task.operate_click.assert_called_once_with(*AutoBidAuctionTask.POS_CITY_FUN_ENTRY)
+        task._click_instant_lot.assert_called_once()
+
+    def test_return_to_auction_fails_when_city_fun_panel_missing(self):
+        task = self._task()
+        task.ensure_main = Mock()
+        task.openF5panel = Mock()
+        task.wait_ocr = Mock(return_value=[])
+        task._click_instant_lot = Mock(return_value=True)
+
+        self.assertFalse(task._return_to_auction(Mock(), self.clock.now + 90))
+        task._click_instant_lot.assert_not_called()
+
+    def test_return_to_auction_attempts_exactly_twice(self):
+        """回场整条路径只重试一次, 即总共走两次。
+
+        回归: retry_on_action 的循环是 `while not result and count <= attempt`, attempt 是
+        「额外重试次数」, 实际执行 attempt + 1 次。原来传 attempt=2 会走三遍, 每次都要重看
+        一遍面板动画, 把整轮 deadline 耗光 —— 与此处注释声称的「重试一次」不符。
+        """
+        task = self._task()
+        task.ensure_main = Mock()
+        task.openF5panel = Mock()
+        task.wait_ocr = Mock(return_value=[])
+        task._click_instant_lot = Mock(return_value=True)
+
+        self.assertFalse(task._return_to_auction(Mock(), self.clock.now + 90))
+
+        self.assertEqual(task.openF5panel.call_count, 2)
+
+    def test_instant_lot_clicks_without_scrolling_when_visible(self):
+        task = self._task()
+        task.scroll = Mock()
+
+        self.assertTrue(task._click_instant_lot(self.clock.now + 90))
+
+        task.scroll.assert_not_called()
+
+    def test_instant_lot_scrolls_then_gives_up(self):
+        """「即刻落槌」在面板最后一页, 找不到时要滚动重试, 用尽次数后放弃。"""
+        task = self._task()
+        task._wait_operate_click = Mock(return_value=False)
+        task.scroll = Mock()
+
+        self.assertFalse(task._click_instant_lot(self.clock.now + 90))
+
+        self.assertEqual(task.scroll.call_count, AutoBidAuctionTask.RECOVER_SCROLL_STEPS)
+
+    def test_current_venue_is_read_for_logging(self):
+        task = self._task()
+        box = Mock()
+        box.name = "当前：海贝场"
+        task.ocr = Mock(return_value=[box])
+
+        self.assertEqual(task._read_current_venue(), "当前：海贝场")
+
+    def test_current_venue_read_failure_is_not_fatal(self):
+        """会场文字只用于日志留痕, 读不出不能影响回场结果。"""
+        task = self._task()
+        task.ocr = Mock(side_effect=RuntimeError("no frame"))
+
+        self.assertEqual(task._read_current_venue(), "")
 
 
 class TestAuctionBidModeConfigVisibility(unittest.TestCase):
@@ -2576,13 +2984,30 @@ class TestAuctionAssistFeaturesConfig(unittest.TestCase):
     def test_welfare_is_claimed_only_when_checked(self):
         for features in ([AutoBidAuctionTask.ASSIST_WELFARE], []):
             task = self._task_with(features)
-            task._claim_welfare_if_needed = Mock(return_value=True)
+            task._read_asset_value = Mock(return_value=1)
+            task._try_claim_welfare = Mock(return_value=True)
 
             task._run_post_round_actions(Mock(), None)
 
             with self.subTest(features=features):
-                self.assertEqual(task._claim_welfare_if_needed.called, bool(features))
+                # 资产低于阈值, 勾选了低保金才会真的去领取。
                 self.assertEqual(task._post_round_state.welfare_claimed, bool(features))
+
+    def test_asset_is_recorded_even_when_welfare_unchecked(self):
+        """取消勾选「低保金」不能连带停掉资产记录。
+
+        资产历史是独立的长期观测; 曾经把记录挂在低保金领取流程里, 用户一旦取消勾选
+        低保金(很常见的配置), 任务运行完全正常但一条数据都写不出来, 静默丢数据。
+        """
+        from src.tasks.mixin.RoundMixin import RoundState
+
+        task = self._task_with([])
+        task._round_state = RoundState(total=0, index=4)
+        task._read_asset_value = Mock(return_value=8_844_793)
+
+        task._run_post_round_actions(Mock(), None)
+
+        task._asset_history.record.assert_called_once_with(8_844_793, round_index=4)
 
 
 class TestAuctionAssistConfigMigration(unittest.TestCase):
@@ -2947,22 +3372,23 @@ class TestAuctionPostRoundTimeoutGrace(unittest.TestCase):
     def _expired(self) -> float:
         return auction_module.time.monotonic() - 1.0
 
-    def test_claim_welfare_skips_when_deadline_used_up(self):
+    def test_asset_observe_skips_when_deadline_used_up(self):
         task = _make_task()
         task._read_asset_value = Mock(return_value=1)
 
-        self.assertFalse(task._claim_welfare_if_needed(Mock(), self._expired()))
+        self.assertIsNone(task._observe_main_asset(Mock(), self._expired()))
         task._read_asset_value.assert_not_called()
 
     def test_inventory_probe_and_notice_popup_share_the_same_grace(self):
-        """三个步骤的口径必须一致: 任一在过期 deadline 上抛异常都会毁掉整轮。"""
+        """四个步骤的口径必须一致: 任一在过期 deadline 上抛异常都会毁掉整轮。"""
         task = _make_task()
         task._read_asset_value = Mock(return_value=1)
         expired = self._expired()
 
         task._dismiss_notice_popup(Mock(), expired, "探针")
         task._detect_inventory_full(Mock(), task._timeout_or_zero(expired, 3))
-        task._claim_welfare_if_needed(Mock(), expired)
+        task._observe_main_asset(Mock(), expired)
+        task._claim_welfare_if_needed(Mock(), expired, None)
 
     def test_post_round_actions_still_records_observation_on_welfare_timeout(self):
         """低保金领取超时时, 观测结果仍要写回, 否则轮次末尾会连带跳过出售。"""
@@ -3176,7 +3602,9 @@ class TestAuctionEstimatePartialReadLogging(unittest.TestCase):
     def _task(self, values) -> AutoBidAuctionTask:
         task = _make_task()
         task.sleep = Mock(side_effect=self.clock.sleep)
-        task._read_asset_value = Mock(side_effect=list(values) + [None] * 40)
+        task._read_estimate_value = Mock(
+            side_effect=[(v, False) for v in values] + [(None, False)] * 40
+        )
         return task
 
     def test_single_valid_read_is_reported_as_suspicious(self):
