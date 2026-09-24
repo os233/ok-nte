@@ -55,7 +55,10 @@ def _make_task(config: dict | None = None) -> AutoBidAuctionTask:
     # patch.object(AutoBidAuctionTask, "width", property(...)) 自行覆盖
     # (见 TestAuctionEstimateEdgeMargin)。
     task._executor = Mock(method=Mock(width=1920))
-    # 掉线回场靠基类的 in_world() 判定大世界, 默认不在大世界; 相关用例自行覆盖。
+    # 掉线回场靠基类的 in_team_and_world() 判定大世界(= is_in_team() and in_world())。
+    # 两个输入都桩掉、让基类的合取逻辑真跑, 默认「在队伍里但不在大世界」; 需要「在大世界」
+    # 的用例只覆盖 in_world, 需要覆盖误报的用例覆盖 is_in_team。
+    task.is_in_team = Mock(return_value=True)
     task.in_world = Mock(return_value=False)
     # 框架的 wait_click_ocr 直接走 click_box, 不会保存和还原鼠标位置,
     # 后台执行时会把用户的鼠标留在游戏窗口内; 任务内任何调用都视为回归。
@@ -270,14 +273,16 @@ class TestAuctionRoundFailureHandling(unittest.TestCase):
 
         task._warn_if_extra_sell_is_redundant.assert_not_called()
 
-    def test_run_calls_auction_entry_before_the_loop(self):
-        """入口回场必须在 do_run 里真的被调用, 且发生在第一轮之前。
+    def test_run_confirms_auction_entry_every_round(self):
+        """入口确认必须每轮都跑一次, 且排在该轮拍卖之前。
 
-        漏调不会让任何用例失败(人在大世界时仍会由 _stage_match 空转兜底),
-        因此最容易被静默删掉 —— 代价是首轮白等约一分钟, 只有实测才看得出来。
+        漏调不会让任何用例失败(人不在拍卖界面时仍会由 _stage_match 空转兜底),
+        因此最容易被静默删掉 —— 代价是后续每轮白等 MATCH_TIMEOUT(120 秒), 只有实测
+        才看得出来。只在循环外调一次同样算漏: 上一轮掉线或异常退出时人可能已经不在
+        拍卖界面了, 后续每轮都得再兜一次。
         """
         task = _make_task()
-        _stub_round_loop(task, total_polls=1)
+        _stub_round_loop(task, total_polls=2)
         order: list[str] = []
         task._ensure_auction_entry = Mock(side_effect=lambda _b: order.append("entry"))
 
@@ -288,8 +293,8 @@ class TestAuctionRoundFailureHandling(unittest.TestCase):
 
         task.do_run()
 
-        task._ensure_auction_entry.assert_called_once()
-        self.assertEqual(order, ["entry", "round"])
+        self.assertEqual(task._ensure_auction_entry.call_count, 2)
+        self.assertEqual(order, ["entry", "round", "entry", "round"])
 
 
 class TestAuctionWelfareDialogClose(unittest.TestCase):
@@ -2587,11 +2592,26 @@ class TestAuctionWorldDropRecovery(unittest.TestCase):
         task.sleep = Mock(side_effect=self.clock.sleep)
         return task
 
-    def test_world_screen_forwards_to_in_world(self):
+    def test_world_screen_forwards_to_in_team_and_world(self):
+        """大世界判定走基类的 in_team_and_world(), 组队血条与小地图箭头都要查。"""
         task = self._task(world=True)
 
         self.assertTrue(task._is_world_screen())
         task.in_world.assert_called_once()
+        task.is_in_team.assert_called_once()
+
+    def test_world_screen_rejects_bright_screen_without_team_ui(self):
+        """小地图箭头命中但组队血条不在时不算大世界。
+
+        回归用例: 小地图箭头是 chamfer 打分, 没有「场景饱和」惩罚 —— 搜索区整片偏亮时
+        coverage 与 distance_score 双双为 1, 纯白画面直接满分。实测「都市大亨」面板得
+        1.000、「仪器组合」面板得 0.841, 都越过 0.75 阈值, 与真箭头(0.997)分不开。
+        加上 is_in_team() 的组队血条判定才能挡住这类画面。
+        """
+        task = self._task(world=True)
+        task.is_in_team = Mock(return_value=False)
+
+        self.assertFalse(task._is_world_screen())
 
     def test_world_screen_swallows_detection_errors(self):
         """大世界判定依赖模板匹配, 判定失败不能打断拍卖主流程。"""
