@@ -9,6 +9,7 @@ from ok import Config, TaskDisabledException, WaitFailedException
 from ok.core.config_schema import build_config_fields
 
 import src.tasks.AutoBidAuctionTask as auction_module
+from src.scene.PositionMap import PositionMap
 from src.tasks.AutoBidAuctionTask import (
     RE_CANCEL,
     RE_CLAIM,
@@ -46,6 +47,8 @@ def _make_task(config: dict | None = None) -> AutoBidAuctionTask:
     task.check_monthly_card = Mock(return_value=False)
     task.handle_monthly_card = Mock()
     task.info_set = Mock()
+    # 位置表由 BaseNTETask.__init__ 建立, 桩实例要自己补一份, 否则 self.pos.* 会 AttributeError。
+    task.pos = PositionMap(task)
     # 贴边阈值按屏幕宽度换算(见 ESTIMATE_EDGE_MARGIN_RATIO), 而框架的 width 属性会一路
     # 走到 executor.method.width, executor 又读 _executor —— 桩实例没有它, 必须在这里给
     # 一个默认屏幕宽。需要验证高分辨率行为的用例用
@@ -2723,7 +2726,7 @@ class TestAuctionWorldDropRecovery(unittest.TestCase):
 
         task.ensure_main.assert_called()
         task.openF5panel.assert_called_once()
-        task.operate_click.assert_called_once_with(*AutoBidAuctionTask.POS_CITY_FUN_ENTRY)
+        task.operate_click.assert_called_once_with(*task.pos.panels.f5.hobbies)
         task._click_instant_lot.assert_called_once()
 
     def test_return_to_auction_fails_when_city_fun_panel_missing(self):
@@ -4219,8 +4222,10 @@ class TestAuctionEstimatePartialReadLogging(unittest.TestCase):
     """「连续 N 次没有新信息」里可能一次完整读数都没有, 日志不能报「读数稳定」。
 
     画面静止时 OCR 会一直读不出或只读到被 reject_partial 过滤掉的残缺值, 此时 last
-    只是唯一一次成功读数, 未必是终值。行为上仍采用它(比回退基础价更接近真实),
-    但日志必须说清楚这是可疑读数, 否则排查时看不出这个价格是猜的。
+    只是唯一一次成功读数, 未必是终值。这类读数**不采信**: 提前稳判要求「连续读到同一个
+    完整数值」达到 ESTIMATE_STABLE_READS 次, 缺一次就归零, 于是循环只能走到超时兜底。
+    超时后仍会采用它(比回退基础价更接近真实), 但必须用告警说清楚这个价格是猜的,
+    否则排查时看不出它来自一次未必完整的读数。
     """
 
     def setUp(self):
@@ -4238,6 +4243,7 @@ class TestAuctionEstimatePartialReadLogging(unittest.TestCase):
         return task
 
     def test_single_valid_read_is_reported_as_suspicious(self):
+        """只有一次有效读数: 不满足提前稳判, 走到超时兜底并告警说明该值可疑。"""
         task = self._task([6000])
 
         value = task._read_stable_asset_value(Mock(), 10, "当前估价", skip_zero=True)
@@ -4246,15 +4252,23 @@ class TestAuctionEstimatePartialReadLogging(unittest.TestCase):
         infos = [str(c.args[0]) for c in task.log_info.call_args_list]
         warnings = [str(c.args[0]) for c in task.log_warning.call_args_list]
         self.assertFalse([msg for msg in infos if "稳定" in msg])
-        self.assertTrue([msg for msg in warnings if "有效读数" in msg])
+        self.assertTrue([msg for msg in warnings if "未稳定" in msg])
 
     def test_repeated_identical_reads_are_still_reported_as_stable(self):
-        task = self._task([6000, 6000, 6000])
+        """连续读到同一个完整数值且超过最短观察窗口, 才走「读数稳定」而非超时兜底。
+
+        ESTIMATE_MIN_OBSERVE_SECONDS=4.0 而 POLL_INTERVAL=0.5, 第 N 帧的 now 是
+        first_seen + (N-1)*0.5, 所以至少要 9 帧相同值才够观察窗口; 用 10 帧留一帧余量。
+        """
+        task = self._task([6000] * 10)
 
         value = task._read_stable_asset_value(Mock(), 10, "当前估价", skip_zero=True)
 
         self.assertEqual(value, 6000)
         self.assertTrue([c for c in task.log_info.call_args_list if "稳定" in str(c.args[0])])
+        self.assertFalse(
+            [c for c in task.log_warning.call_args_list if "未稳定" in str(c.args[0])]
+        )
 
 
 class TestAuctionInstructions(unittest.TestCase):
