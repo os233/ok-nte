@@ -174,6 +174,31 @@ class TestAssetReport(_TempHistoryMixin, unittest.TestCase):
         self.assertEqual(summaries[1].change, 500)
         self.assertEqual(summaries[0].samples, 3)
 
+    def test_daily_summary_follows_timestamps_not_file_order(self):
+        """净变化必须按时间戳取首末, 不能按物理行序取。
+
+        文件是追加写的, 但用户手工整理数据、日志回放或多任务交错都会让行序变乱;
+        按物理首末行算会给出**符号相反**的净变化且不报任何错
+        (实测同日先写 t=200/100、再写 t=100/500 时算出 +400, 按时间序应为 -400)。
+        """
+        from tools.asset_report import summarize_by_day
+
+        day = 86_400
+        base = 1_700_000_000 - (1_700_000_000 % day)
+        self._write(
+            [
+                (base + 3_600, 100),  # 物理第一行, 但时间上更晚
+                (base + 60, 500),  # 物理第二行, 时间上更早
+            ]
+        )
+
+        summaries = summarize_by_day(read_records(self.history_path))
+
+        self.assertEqual(len(summaries), 1)
+        self.assertEqual(summaries[0].first, 500)
+        self.assertEqual(summaries[0].last, 100)
+        self.assertEqual(summaries[0].change, -400)
+
     def test_markdown_reports_negative_change_with_sign(self):
         """资产减少时报告要显式带负号, 不能只靠数字大小去猜。"""
         from tools.asset_report import build_markdown

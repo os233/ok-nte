@@ -2,7 +2,7 @@ import math
 import re
 import time
 from dataclasses import dataclass
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from enum import Enum
 
 from ok import Box, Config, TaskDisabledException, WaitFailedException
@@ -424,6 +424,14 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
     # 出售连续失败到这个次数后放宽「保留品质」再试一次: 满仓卖不掉会让后续出价全部失败,
     # 这时候把仓库腾空的优先级高于保留指定品质.
     SELL_FAILURE_ESCALATE_AFTER = 2
+
+    # 轮次末尾出售流程的总预算。出售是收尾动作, 不该像拍卖阶段那样吃掉整轮 600 秒:
+    # 逐分支等待下限约 35 秒, 连续失败放宽再走一趟约 71 秒, 留一倍余量。
+    SELL_TIMEOUT = 90
+
+    # 关闭藏品仓库的重试次数。批量关闭失败会把「出售模式 + 已勾选品质」留给下一轮,
+    # 下次进来会无条件再点一遍同一批品质(全部取反), 必须确认真的关掉了。
+    WAREHOUSE_CLOSE_RETRIES = 3
 
     # 结算界面的「一键出售」: 跳过动画刚点完, 按钮本来就该在, 给短超时即可.
     ONE_CLICK_SELL_TIMEOUT = 3
@@ -1085,7 +1093,7 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
             # 满仓提示会被弹窗遮住, 重新检测失败就什么都不做, 变成每轮空跳的死循环.
             self.log_warning("满仓且上次出售未成功, 跳过本轮拍卖, 先重试清理藏品")
             self.add_failed("满仓未清理")
-            self._sell_collections_on_interval(boxes, state=PostRoundState(inventory_full=True))
+            self._try_sell_collections(PostRoundState(inventory_full=True), boxes)
             return
 
         finished = self._exec_auction_round(boxes)
@@ -1100,7 +1108,27 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
             # - finished 为 False 时画面仍在拍卖出价界面, 出售只会在仓库入口白等超时;
             # - observed 为 False 说明 _finish_auction 没识别到主界面标题就返回了,
             #   画面状态未知, 同样不能去点仓库入口.
-            self._sell_collections_on_interval(boxes, state=self._post_round_state)
+            self._try_sell_collections(self._post_round_state, boxes)
+
+    def _try_sell_collections(self, state: PostRoundState, boxes: AuctionBoxes) -> None:
+        """轮次末尾的出售入口: 给出售流程一个独立的、有界的预算。
+
+        原本两处调用都不传 deadline, 于是 _bounded_timeout(deadline=None, ...) 一律
+        原样返回 limit、_timeout_or_zero 也永不返回 0 —— 整条出售流程实际上没有任何
+        上级预算。逐分支累加的等待下限约 35 秒(连续失败放宽时约 71 秒), 而它不消耗
+        ROUND_TIMEOUT(600): 「满仓时清理」每轮都要走一遍, 仓库入口读不到时就变成
+        「任务在跑但几乎不出价」, 且日志里看不出时间被谁吃掉。
+
+        出售失败不该影响本轮已经记下的成功/失败结论, 所以这里兜住 WaitFailedException ——
+        补上 deadline 后 _sell_collections 收尾的 _bounded_sleep 会在预算耗尽时抛它。
+        """
+        sell_deadline = time.monotonic() + self.SELL_TIMEOUT
+        try:
+            self._sell_collections_on_interval(boxes, sell_deadline, state=state)
+        except TaskDisabledException:
+            raise
+        except WaitFailedException as e:
+            self.log_warning(f"藏品出售超出 {self.SELL_TIMEOUT} 秒预算, 本轮放弃出售: {e}")
 
     # --- 单轮流程编排 ---
     def _exec_auction_round(self, boxes: AuctionBoxes) -> bool:
@@ -1471,6 +1499,13 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         轮次记成失败; 「返回匹配界面」分支更静默 —— _observe_post_round_on_main_screen
         拿不到时间就直接返回, _post_round_state.observed 保持 False, 轮次末尾不出售,
         满仓时后续每轮都会卡在「开始匹配」上。
+
+        主界面判定必须排在「跳过动画」之前: 两个区域都落在主界面底部按钮带
+        (skip_area 0.703~0.807 / 0.902~0.953 与 BOX_MATCH 0.7427~0.8360 / 0.8972~0.9472
+        大面积重叠), 主界面上误读到「跳过」时, 若先走跳过分支就会点一个不存在的
+        「跳过动画」、再等一个不存在的「退出拍卖」按钮, 失败时抛异常跳过整个
+        _run_post_round_actions —— 而 _post_round_state.observed 保持 False 的后果
+        正是上面那段描述的「满仓时清理完全失效」。
         """
         self.log_info("结算阶段开始, 等待拍卖结果")
         result_deadline = min(deadline, time.monotonic() + self.RESULT_TIMEOUT)
@@ -1480,14 +1515,14 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
             loop_count += 1
             self.next_frame()
 
-            skip_results = self.ocr(box=boxes.skip_area, match=RE_SKIP)
-            if skip_results:
-                self._finish_auction(boxes, skip_results, deadline)
-                return True
-
             if self._is_match_screen(boxes):
                 self.log_info("返回匹配界面")
                 self._observe_post_round_on_main_screen(boxes, deadline)
+                return True
+
+            skip_results = self.ocr(box=boxes.skip_area, match=RE_SKIP)
+            if skip_results:
+                self._finish_auction(boxes, skip_results, deadline)
                 return True
 
             if self._is_bid_screen(boxes):
@@ -2424,7 +2459,13 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         return mode
 
     def _raise_price(self, base_price: int, bid_count: int) -> int:
-        """按配置的加价方式计算第 bid_count 次出价的价格。"""
+        """按配置的加价方式计算第 bid_count 次出价的价格。
+
+        全程用 Decimal 计算: 倍率模式是 `base * value ** offset`, 用原始 float 时
+        「加价数值」填得稍大就会在 `value ** offset` 上抛 OverflowError(实测
+        `100000 * 10.0 ** 400`)。异常会被 _stage_bid_loop 吞成「出价异常」重试,
+        价格永远算不出来, 却看不到真正的原因。
+        """
         mode = self._raise_mode()
         value = self._config_float(self.CONF_RAISE_VALUE, 0.0)
         raise_round = self._config_int(self.CONF_RAISE_ROUND, 0)
@@ -2437,18 +2478,45 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         offset = bid_count if raise_round == 0 else bid_count - raise_round + 1
 
         # 根据所选方式计算价格.
-        if mode == self.RAISE_MODE_MULTIPLE:
-            # 指数增长: 基础价 * (倍率 ^ offset).
-            result = base_price * (value**offset)
-        elif mode == self.RAISE_MODE_PERCENT:
-            # 线性增长: 基础价 * (1 + 百分比 / 100 * offset).
-            result = base_price * (1 + value / 100 * offset)
-        else:  # 自定义
-            # 线性增长: 基础价 + 自定义值 * offset.
-            result = base_price + value * offset
+        try:
+            base = Decimal(str(base_price))
+            factor = Decimal(str(value))
+            if mode == self.RAISE_MODE_MULTIPLE:
+                # 指数增长: 基础价 * (倍率 ^ offset).
+                result = base * (factor**offset)
+            elif mode == self.RAISE_MODE_PERCENT:
+                # 线性增长: 基础价 * (1 + 百分比 / 100 * offset).
+                result = base * (Decimal(1) + factor / 100 * offset)
+            else:  # 自定义
+                # 线性增长: 基础价 + 自定义值 * offset.
+                result = base + factor * offset
+            # 量化必须留在 try 内: Decimal 的指数范围极大, `10 ** 400` 仍是有限值,
+            # is_finite() 拦不住; 但它有 405 位有效数字, 超过默认上下文精度 28,
+            # 到这一步 quantize 才抛 InvalidOperation。放在 try 外等于把
+            # OverflowError 换成同样会漏出的 InvalidOperation。
+            # 位数粗筛(整数部分 30 位以上)提前挡掉, 避免真的把大数交给 quantize。
+            rounded = (
+                result.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+                if result.adjusted() < 30
+                else None
+            )
+            if rounded is None:
+                result = None
+            else:
+                result = rounded
+        except (ArithmeticError, InvalidOperation, ValueError):
+            result = None
 
-        # 四舍五入为整数.
-        final_price = int(Decimal(str(result)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+        # 溢出/精度异常时 result 为 None, 或退化成非有限值(NaN / Infinity).
+        if result is None or not result.is_finite():
+            self.log_warning(
+                f"加价计算结果超出可表示范围, 回退到基础价 {base_price} "
+                f"(模式 {mode}, 数值 {value}, 加价偏移 {offset})"
+            )
+            return base_price
+
+        # 已在 try 内完成量化, 这里直接取整.
+        final_price = int(result)
 
         # 确保计算结果为正整数.
         if final_price <= 0:
@@ -2508,14 +2576,21 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
 
     @staticmethod
     def _price_key_sequence(price_str: str) -> list[str]:
-        """把价格字符串切分为按键序列, 可一次输入的 0000 / 00 优先整体输入。"""
+        """把价格字符串切分为按键序列, 可一次输入的 0000 / 00 优先整体输入。
+
+        按**最长优先**做前缀匹配, 而不是只在「剩余整串恰好等于快捷键」时才用:
+        后者会把 `1000000` 切成 `1 0 0 0000`(4 键), 前缀匹配切成 `1 0000 00`(3 键),
+        而每次点击都带 after_sleep —— 少按一键就少一次 0.2 秒的等待。
+        """
+        shortcuts = sorted(PAD_SHORTCUTS, key=len, reverse=True)
         keys: list[str] = []
         index = 0
         while index < len(price_str):
-            remaining = price_str[index:]
-            if remaining in PAD_SHORTCUTS:
-                keys.append(remaining)
-                index = len(price_str)
+            for shortcut in shortcuts:
+                if price_str.startswith(shortcut, index):
+                    keys.append(shortcut)
+                    index += len(shortcut)
+                    break
             else:
                 keys.append(price_str[index])
                 index += 1
@@ -2866,8 +2941,26 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         出售流程无论成功还是异常退出都要走到这一步。关闭按钮是无文字图标(OCR 在所有
         截图上都读到空), 只能按调用点确认含义; 在主界面点它是空操作, 所以异常发生在
         「还没打开仓库」的阶段时也安全。
+
+        点完要确认仓库真的关了(标题消失)再重试一次: 仓库连同「出售模式 + 已勾选的品质」
+        留给下一轮时, 下次进来会检测到「已在出售模式」而跳过点「出售」, 然后无条件再点
+        一遍同一批品质 —— 全部取反成未勾选, 满仓放宽时还会连带卖掉用户明确保留的品质。
+        关不掉时只告警不抛: 这里是异常收尾路径, 再抛异常会盖掉真正的失败原因。
         """
-        self.operate_click(boxes.close, after_sleep=0)
+        for attempt in range(1, self.WAREHOUSE_CLOSE_RETRIES + 1):
+            self.operate_click(boxes.close, after_sleep=0.5)
+            if not self._is_warehouse_open(boxes):
+                return
+            self.log_warning(
+                f"第 {attempt}/{self.WAREHOUSE_CLOSE_RETRIES} 次点击关闭后藏品仓库仍未收起"
+            )
+        self.log_warning("藏品仓库界面多次尝试后仍未关闭, 下一轮可能受残留勾选影响")
+
+    def _is_warehouse_open(self, boxes: AuctionBoxes) -> bool:
+        """检测藏品仓库界面是否还在, 复用标题区域的 OCR。"""
+        return bool(
+            self.ocr(box=boxes.warehouse_title, match=RE_WAREHOUSE, log=False)
+        )
 
     @staticmethod
     def _is_selection_confirmed(
@@ -2907,25 +3000,28 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         不再保留配置里指定的品质。成功一次就清零计数。
 
         非满仓的失败多半是界面重绘导致的读数抖动, 此时放宽会白白卖掉用户明确要
-        保留的品质, 而收益为零 —— 所以只在满仓时放宽。
+        保留的品质, 而收益为零 —— 所以只在满仓时放宽, **也只在满仓失败时累积计数**。
+
+        计数必须按「满仓失败」累积, 不能让非满仓失败把它填满: 阈值是「满仓连续失败
+        几次后放宽」, 若非满仓的抖动也计入, 阈值会被历史抖动提前填满, 之后满仓的
+        第一次失败就立刻放宽, 把用户明确保留的品质一起卖掉(实测: 非满仓失败 5 次后,
+        紧接一次满仓失败即触发, escalated 集合是 6 个品质全卖)。
         """
         if self._sell_collections(boxes, deadline, extra_sell, require_sale=inventory_full):
             self._sell_failures = 0
             self._inventory_stuck = False
             return True
 
-        self._sell_failures += 1
-        if self._sell_failures < self.SELL_FAILURE_ESCALATE_AFTER:
-            self.log_warning(f"藏品出售未完成 (连续 {self._sell_failures} 次)")
-            self._inventory_stuck = inventory_full
+        if not inventory_full:
+            # 非满仓失败只是读数抖动, 不为将来的满仓放宽积攒「信用」.
+            self.log_warning("藏品出售未完成 (非满仓, 不计入放宽计数)")
+            self._inventory_stuck = False
             return False
 
-        if not inventory_full:
-            # 计数继续累积, 之后真的满仓时仍然会放宽.
-            self.log_warning(
-                f"藏品出售连续 {self._sell_failures} 次未完成, 但未满仓, 保留配置的品质不放松"
-            )
-            self._inventory_stuck = False
+        self._sell_failures += 1
+        if self._sell_failures < self.SELL_FAILURE_ESCALATE_AFTER:
+            self.log_warning(f"藏品出售未完成 (满仓连续 {self._sell_failures} 次)")
+            self._inventory_stuck = inventory_full
             return False
 
         self.log_warning(f"藏品出售连续 {self._sell_failures} 次未完成, 放宽保留品质重试一次")

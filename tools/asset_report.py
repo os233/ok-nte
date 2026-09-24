@@ -50,6 +50,11 @@ def summarize_by_day(records: list[AssetRecord]) -> list[DaySummary]:
 
     同一天的第一条与最后一条之差就是当天净变化; 中间可能跨过多次任务重启,
     所以还带上样本数, 样本很少时这个差值参考价值有限。
+
+    取首末之前必须按 timestamp 显式排序, 不能依赖记录的物理顺序: 文件是追加写的,
+    但用户手工整理、日志回放或多次任务交错时行序会乱, 而 `records[0] / [-1]` 取的是
+    **物理**首末行 —— 乱序文件会给出符号相反的净变化(实测同日先写 t=200/value=100、
+    再写 t=100/value=500, 算出 +400, 按时间序应为 -400)且不报任何错。
     """
     buckets: dict[str, list[AssetRecord]] = defaultdict(list)
     for record in records:
@@ -58,7 +63,7 @@ def summarize_by_day(records: list[AssetRecord]) -> list[DaySummary]:
 
     summaries = []
     for day in sorted(buckets):
-        day_records = buckets[day]
+        day_records = sorted(buckets[day], key=lambda item: item.timestamp)
         summaries.append(
             DaySummary(
                 date=day,

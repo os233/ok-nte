@@ -1538,6 +1538,54 @@ class TestAuctionSellAbortClosesWarehouse(unittest.TestCase):
         self.assertIn(boxes.close, [call.args[0] for call in task.operate_click.call_args_list])
 
 
+class TestAuctionWarehouseCloseRetry(unittest.TestCase):
+    """点「关闭」必须确认仓库真的收起, 一次不成要重试。
+
+    关闭按钮是无文字图标, 点击可能因为动画/焦点没生效; 而仓库连同「出售模式 + 已勾选的
+    品质」留给下一轮时, 下次进来会检测到「已在出售模式」而跳过点「出售」, 然后无条件再点
+    一遍同一批品质 —— 全部取反成未勾选, 满仓放宽时还会卖掉用户明确要保留的品质。
+    """
+
+    def setUp(self):
+        self._boxes = Mock()
+
+    def _task_with(self, open_readings):
+        task = _make_task()
+        task.operate_click = Mock()
+        readings = list(open_readings)
+        task._is_warehouse_open = Mock(
+            side_effect=lambda boxes: readings.pop(0) if readings else False
+        )
+        return task
+
+    def test_closes_on_first_click_without_retrying(self):
+        task = self._task_with([False])
+
+        task._close_warehouse(self._boxes)
+
+        self.assertEqual(task.operate_click.call_count, 1)
+
+    def test_retries_until_the_warehouse_is_gone(self):
+        """前两次点击没生效时, 第三次关掉就应停止重试。"""
+        task = self._task_with([True, True, False])
+
+        task._close_warehouse(self._boxes)
+
+        self.assertEqual(task.operate_click.call_count, 3)
+
+    def test_gives_up_after_the_retry_limit_without_raising(self):
+        """这里是异常收尾路径, 关不掉只能告警, 再抛会盖掉真正的失败原因。"""
+        task = self._task_with([True] * 10)
+
+        task._close_warehouse(self._boxes)
+
+        self.assertEqual(
+            task.operate_click.call_count,
+            AutoBidAuctionTask.WAREHOUSE_CLOSE_RETRIES,
+        )
+        self.assertTrue(task.log_warning.called)
+
+
 class TestAuctionSellFailureEscalation(unittest.TestCase):
     """出售连续失败要升级处理: 满仓卖不掉会让后续出价全部失败。"""
 
@@ -1642,19 +1690,37 @@ class TestAuctionSellFailureEscalation(unittest.TestCase):
         # 只应尝试一次, 没有放宽后的第二次调用.
         self.assertEqual(task._sell_collections.call_count, 1)
 
-    def test_not_full_keeps_the_failure_counter_for_a_later_full_attempt(self):
-        """未满仓时计数继续累积, 之后真的满仓仍要能放宽。"""
+    def test_not_full_failure_does_not_feed_the_escalation_counter(self):
+        """未满仓的失败不该计入放宽计数, 否则满仓的首次失败就会立刻放开放宽。
+
+        阈值 SELL_FAILURE_ESCALATE_AFTER 的含义是「满仓**连续**失败几次后放宽」。
+        若非满仓的读数抖动也往上累积, 阈值会被历史抖动提前填满, 之后满仓第一次失败
+        就触发 escalated = extra_sell | QUALITY_KEYS —— 6 个品质全卖, 包含用户
+        明确保留的那些。实测修复前: 非满仓失败 5 次后紧接一次满仓失败即放宽。
+        """
         task = self._task([False, False, True])
         task._sell_failures = AutoBidAuctionTask.SELL_FAILURE_ESCALATE_AFTER - 1
 
         task._sell_collections_with_escalation(Mock(), None, (), inventory_full=False)
-        self.assertEqual(task._sell_failures, AutoBidAuctionTask.SELL_FAILURE_ESCALATE_AFTER)
+
+        self.assertEqual(task._sell_failures, AutoBidAuctionTask.SELL_FAILURE_ESCALATE_AFTER - 1)
+        self.assertFalse(task._inventory_stuck)
+
+    def test_full_failure_starting_from_zero_still_escalates_after_the_threshold(self):
+        """满仓连续失败到阈值仍必须放宽, 反写计数语义不能把这条能力一起拆掉。"""
+        task = self._task([False, False, True])
+
+        task._sell_collections_with_escalation(Mock(), None, (), inventory_full=True)
+        self.assertEqual(task._sell_failures, 1)
+        # 满仓且没卖成 -> 下一轮要先跳过拍卖去清理仓库.
+        self.assertTrue(task._inventory_stuck)
 
         self.assertTrue(
             task._sell_collections_with_escalation(Mock(), None, (), inventory_full=True)
         )
         escalated = task._sell_collections.call_args.args[2]
         self.assertEqual(set(escalated), set(AutoBidAuctionTask.QUALITY_KEYS))
+        self.assertEqual(task._sell_failures, 0)
 
 
 class TestAuctionNoticePopup(unittest.TestCase):
@@ -1778,11 +1844,49 @@ class TestAuctionInventoryStuckRound(unittest.TestCase):
         """
         task = self._task()
         task._inventory_stuck = True
+        task._sell_collections_with_escalation = Mock(return_value=True)
+        task._detect_inventory_full = Mock(return_value=None)
 
         task._run_single_round(Mock())
 
         state = task._sell_collections_on_interval.call_args.kwargs["state"]
         self.assertTrue(state.inventory_full)
+        # 上面那条只断言了「调用方传了什么」—— 传了 True 不等于被调方真的没再去检测.
+        # 「不该再赌一次 OCR」这条意图必须靠下面的断言钉住: 预置结论已足够,
+        # _sell_collections_on_interval 不能再调 _detect_inventory_full 补测一次.
+        task._detect_inventory_full.assert_not_called()
+
+    def test_stuck_retry_sells_with_the_round_budget(self):
+        """轮次末尾的出售必须带上自己的预算, 不能是无界调用。
+
+        两处调用原本都不传 deadline, _bounded_timeout(deadline=None, ...) 会原样返回
+        limit, 于是整条出售流程不受任何上级预算约束(逐分支等待下限约 35 秒,
+        连续失败放宽时约 71 秒), 而它不消耗 ROUND_TIMEOUT —— 「满仓时清理」每轮都走,
+        仓库入口读不到时表现为「任务在跑但几乎不出价」。
+        """
+        task = self._task()
+        task._inventory_stuck = True
+
+        task._run_single_round(Mock())
+
+        deadline = task._sell_collections_on_interval.call_args[0][1]
+        self.assertIsNotNone(deadline)
+        self.assertGreater(deadline, 0)
+
+    def test_sell_timeout_does_not_fail_the_round(self):
+        """出售超预算只放弃出售, 不能把本轮已记下的结果改掉。"""
+        task = self._task()
+        task._post_round_state = PostRoundState(observed=True)
+        task._inventory_stuck = False
+        task._exec_auction_round = Mock(return_value=True)
+        task._sell_collections_on_interval = Mock(
+            side_effect=WaitFailedException("藏品出售超出预算")
+        )
+
+        task._run_single_round(Mock())
+
+        task.add_success.assert_called_once()
+        task.add_failed.assert_not_called()
 
     def test_normal_round_still_runs_the_auction(self):
         task = self._task()
@@ -3461,6 +3565,61 @@ class TestAuctionRaiseModeRename(unittest.TestCase):
             self._price(AutoBidAuctionTask.RAISE_MODE_CUSTOM),
         )
 
+    def test_huge_exponent_falls_back_instead_of_raising(self):
+        """倍率填得稍大时 `value ** offset` 会超出可表示范围。
+
+        只用 float 时 `100000 * 10.0 ** 400` 抛 OverflowError; 改用 Decimal 后这步
+        不再抛, 但结果有 405 位有效数字, 超过默认上下文精度 28 —— 量化那一步才是真正
+        抛 InvalidOperation 的地方。所以量化必须留在被吞异常的区间内, 否则等于把
+        OverflowError 换成同样会漏出的 InvalidOperation, 价格永远算不出来。
+        """
+        task = _make_task()
+        task.config = _config(
+            **{
+                AutoBidAuctionTask.CONF_RAISE_MODE: AutoBidAuctionTask.RAISE_MODE_MULTIPLE,
+                AutoBidAuctionTask.CONF_RAISE_VALUE: "10.0",
+                AutoBidAuctionTask.CONF_RAISE_ROUND: 0,
+            }
+        )
+
+        self.assertEqual(task._raise_price(100000, 400), 100000)
+        task.log_warning.assert_called()
+
+    def test_normal_magnitude_is_still_quantized_to_an_integer(self):
+        """守住上一条的边界: 常规量级不能被「提前挡掉大数」的逻辑一起废掉。"""
+        task = _make_task()
+        task.config = _config(
+            **{
+                AutoBidAuctionTask.CONF_RAISE_MODE: AutoBidAuctionTask.RAISE_MODE_MULTIPLE,
+                AutoBidAuctionTask.CONF_RAISE_VALUE: "1.6",
+                AutoBidAuctionTask.CONF_RAISE_ROUND: 0,
+            }
+        )
+
+        # raise_round=0 -> offset = bid_count = 2 -> 100 * 1.6 ** 2
+        self.assertEqual(task._raise_price(100, 2), 256)
+
+    def test_long_zeros_collapse_into_the_pad_shortcut(self):
+        """按键序列要按最长前缀合并, 否则 1000000 会退化成逐位按 7 次。
+
+        键盘快捷键有 0000 与 00 两档。贪心算法只看「剩余整串是否恰好是某个快捷键」,
+        1000000 会拆成 ['1','0','0','0000'] —— 4 次按键, 而最优是 ['1','0000','00']。
+        """
+        self.assertEqual(
+            AutoBidAuctionTask._price_key_sequence("1000000"),
+            ["1", "0000", "00"],
+        )
+
+    def test_key_sequence_never_changes_the_price_text(self):
+        """任何价格都要能被按键序列原样拼回来, 否则会输错金额。"""
+        for price in ("1", "20", "100", "1000", "6600", "10000", "100000",
+                      "300000", "66666", "1000000", "166660"):
+            with self.subTest(price=price):
+                self.assertEqual(
+                    "".join(AutoBidAuctionTask._price_key_sequence(price)),
+                    price,
+                )
+
 
 class TestAuctionRaiseModeMigration(unittest.TestCase):
     """存量配置里的「倍数」要在加载时改写, 否则下拉框空白且价格静默变线性。"""
@@ -3762,7 +3921,18 @@ class TestAuctionResultStageBudget(unittest.TestCase):
 
         task.ocr = tick
         if mode == "match":
-            task._is_match_screen = lambda boxes: counter["n"] > spins
+            # 用**循环轮次**而不是 tick 调用次数做判据: _is_match_screen 排在 skip 判定
+            # 之前(见 AutoBidAuctionTask._stage_result), 同一轮里它先被调用, 此时 tick
+            # 还没跑过, counter["n"] 仍是上一轮的值 —— 按调用次数判定会晚一轮才命中,
+            # 空转到 result_deadline 之后循环先退出, 这个用例就永远走不到 match 分支
+            # (它此前能通过, 纯靠 skip 分支意外兜住)。
+            loop = {"n": 0}
+
+            def match_screen(boxes):
+                loop["n"] += 1
+                return loop["n"] > spins
+
+            task._is_match_screen = match_screen
         return task
 
     def test_finish_auction_receives_round_deadline(self):
@@ -3797,6 +3967,28 @@ class TestAuctionResultStageBudget(unittest.TestCase):
 
         self.assertTrue(task._stage_result(Mock(), round_deadline))
         task._run_post_round_actions.assert_called_once()
+
+    def test_skip_area_reading_does_not_shadow_the_match_branch(self):
+        """skip 区域与主界面标题框重叠: 同一帧两者可能同时命中。
+
+        BOX_SKIP(0.703,0.902,0.807,0.953) 与 BOX_MATCH(0.7427,0.8972,0.8360,0.9472)
+        高度重叠, 所谓「跳过动画」其实是在主界面同一位置读到的文字。修复前 skip 判定
+        排在 match 之前, 命中 skip 就去 _finish_auction —— 可画面已经在主界面, 找不到
+        退出按钮而抛异常, _run_post_round_actions 被跳过, 满仓检测/低保金/轮次末尾出售
+        全部丢失。所以 match 必须排在 skip 前面。
+        """
+        task = self._task(0, mode="match")
+        # 让 skip 区域也读到内容: 旧顺序下会抢在 match 之前命中
+        task.ocr = Mock(return_value=[Mock()])
+        task._is_match_screen = Mock(return_value=True)
+        task._finish_auction = Mock()
+        task._observe_post_round_on_main_screen = Mock()
+        round_deadline = self.clock.now + AutoBidAuctionTask.ROUND_TIMEOUT
+
+        self.assertTrue(task._stage_result(Mock(), round_deadline))
+
+        task._observe_post_round_on_main_screen.assert_called_once()
+        task._finish_auction.assert_not_called()
 
     def test_slow_settlement_on_match_branch_keeps_observation(self):
         """「返回匹配界面」分支空转 89.5 秒后, 结算后观测仍要执行。"""
