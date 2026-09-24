@@ -10,7 +10,6 @@ from ok.util.file import get_relative_path, read_json_file
 
 from src.tasks.BaseNTETask import BaseNTETask
 from src.tasks.NTEOneTimeTask import NTEOneTimeTask
-from src.utils.asset_history import AssetHistoryRecorder
 
 # --- 拍卖界面 OCR 正则 ---
 # 集中定义, 避免各阶段重复编译同一规则。
@@ -538,9 +537,6 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         # 任务卡上的「说明」按钮只在 instructions 非空时出现, 内容是富文本 HTML.
         self.instructions = INST
         self.add_rounds_config()
-        # 资产历史落盘器: 每轮回主界面读到资产值后追加一条 JSONL 记录。
-        # 读取侧的路径见 src/utils/asset_history.py, 报告脚本见 tools/asset_report.py。
-        self._asset_history = AssetHistoryRecorder()
         # 本轮回场配额, 由 _exec_auction_round 每轮重置。这里先给初值, 使任务实例在任何
         # 入口(包括测试直接调 _stage_match)下都有确定行为 —— 缺省视为「本轮回场机会已用完」,
         # 不会因为没有轮次上下文而无限回场。
@@ -1763,7 +1759,6 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
             return None
 
         self.log_info(f"当前资产: {asset_value}")
-        self._record_asset_value(asset_value)
         return asset_value
 
     def _claim_welfare_if_needed(
@@ -1784,28 +1779,6 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
 
         self.log_info(f"资产低于{self.WELFARE_ASSET_THRESHOLD}, 执行低保金领取")
         return self._try_claim_welfare(boxes, deadline)
-
-    def _record_asset_value(self, asset_value: int) -> None:
-        """把本轮读到的主界面资产值追加到本地历史文件。
-
-        记录失败(磁盘满、目录只读等)只写 warn 日志, 绝不向上抛: 已经成功结算的轮次
-        不能因为写不进一个统计文件被判成失败。
-        """
-        try:
-            record = self._asset_history.record(
-                asset_value, round_index=self.current_round
-            )
-        except Exception as e:
-            self.log_warning(f"资产记录写入异常: {type(e).__name__}: {e}")
-            return
-
-        if record is None:
-            self.log_warning("资产记录写入失败, 本轮资产未落盘")
-            return
-
-        if record.delta is not None:
-            sign = "+" if record.delta >= 0 else ""
-            self.log_info(f"资产变化: {sign}{record.delta} (上次 {record.value - record.delta})")
 
     # --- 界面状态判定 ---
     def _is_match_screen(self, boxes: AuctionBoxes) -> bool:

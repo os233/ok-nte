@@ -61,10 +61,6 @@ def _make_task(config: dict | None = None) -> AutoBidAuctionTask:
     task._post_round_state = PostRoundState()
     task._sell_failures = 0
     task._inventory_stuck = False
-    # 资产历史落盘器: 默认替换成不落盘的内存桩, 避免测试往仓库写 data/asset_history.jsonl。
-    # 需要断言写入行为的用例自行覆盖成真实记录器(见 TestAssetHistory)。
-    task._asset_history = Mock()
-    task._asset_history.record = Mock(return_value=None)
     return task
 
 
@@ -3340,21 +3336,23 @@ class TestAuctionAssistFeaturesConfig(unittest.TestCase):
                 # 资产低于阈值, 勾选了低保金才会真的去领取。
                 self.assertEqual(task._post_round_state.welfare_claimed, bool(features))
 
-    def test_asset_is_recorded_even_when_welfare_unchecked(self):
-        """取消勾选「低保金」不能连带停掉资产记录。
+    def test_asset_is_observed_even_when_welfare_unchecked(self):
+        """取消勾选「低保金」不能连带停掉资产读数的日志。
 
-        资产历史是独立的长期观测; 曾经把记录挂在低保金领取流程里, 用户一旦取消勾选
-        低保金(很常见的配置), 任务运行完全正常但一条数据都写不出来, 静默丢数据。
+        资产观测是独立的长期观测; 曾经把观测挂在低保金领取流程里, 用户一旦取消勾选
+        低保金(很常见的配置), 任务运行完全正常但日志里再也看不到资产值, 静默丢观测。
         """
-        from src.tasks.mixin.RoundMixin import RoundState
+        for features in ([], [AutoBidAuctionTask.ASSIST_WELFARE]):
+            task = self._task_with(features)
+            task._read_asset_value = Mock(return_value=8_844_793)
 
-        task = self._task_with([])
-        task._round_state = RoundState(total=0, index=4)
-        task._read_asset_value = Mock(return_value=8_844_793)
+            with self.subTest(features=features):
+                task._run_post_round_actions(Mock(), None)
 
-        task._run_post_round_actions(Mock(), None)
-
-        task._asset_history.record.assert_called_once_with(8_844_793, round_index=4)
+                self.assertIn(
+                    "当前资产: 8844793",
+                    [str(call.args[0]) for call in task.log_info.call_args_list],
+                )
 
 
 class TestAuctionAssistConfigMigration(unittest.TestCase):
