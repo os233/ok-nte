@@ -1,4 +1,5 @@
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -265,6 +266,27 @@ class TestAuctionRoundFailureHandling(unittest.TestCase):
             task.do_run()
 
         task._warn_if_extra_sell_is_redundant.assert_not_called()
+
+    def test_run_calls_auction_entry_before_the_loop(self):
+        """入口回场必须在 do_run 里真的被调用, 且发生在第一轮之前。
+
+        漏调不会让任何用例失败(人在大世界时仍会由 _stage_match 空转兜底),
+        因此最容易被静默删掉 —— 代价是首轮白等约一分钟, 只有实测才看得出来。
+        """
+        task = _make_task()
+        _stub_round_loop(task, total_polls=1)
+        order: list[str] = []
+        task._ensure_auction_entry = Mock(side_effect=lambda _b: order.append("entry"))
+
+        def single_round(_boxes):
+            order.append("round")
+
+        task._run_single_round = single_round
+
+        task.do_run()
+
+        task._ensure_auction_entry.assert_called_once()
+        self.assertEqual(order, ["entry", "round"])
 
 
 class TestAuctionWelfareDialogClose(unittest.TestCase):
@@ -2765,6 +2787,93 @@ class TestAuctionWorldDropRecovery(unittest.TestCase):
         self.assertEqual(task._read_current_venue(), "")
 
 
+class TestAuctionEntryRecover(unittest.TestCase):
+    """启动时的入口回场: 从大世界直接启动也要能进拍卖界面。
+
+    原来只能靠第一轮 `_stage_match` 空转到 MATCH_TIMEOUT 才由末尾的大世界兜底触发回场,
+    首轮白等约一分钟。`_ensure_auction_entry` 复用同一条回场路径把这个等待提到启动时。
+    """
+
+    def setUp(self):
+        self.clock = _FakeTime()
+        patcher = patch.object(auction_module, "time", self.clock)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _task(self, *, in_auction: bool, world: bool = False) -> AutoBidAuctionTask:
+        task = _make_task()
+        # wait_ocr 同时被「读主界面标题」和回场内部调用; 用 side_effect 区分:
+        # 首次调用是入口探测, 由 in_auction 决定命中与否。
+        task.wait_ocr = Mock(side_effect=[Mock() if in_auction else [], Mock()])
+        task.in_world = Mock(return_value=world)
+        task._return_to_auction = Mock(return_value=True)
+        return task
+
+    def test_already_in_auction_skips_recover(self):
+        """已在拍卖界面时只多花一次标题探测, 不触发任何回场动作。"""
+        task = self._task(in_auction=True)
+
+        task._ensure_auction_entry(Mock())
+
+        task._return_to_auction.assert_not_called()
+
+    def test_auction_screen_wins_over_world_probe(self):
+        """已在拍卖界面时直接返回, 不再去探测大世界。
+
+        「主界面标题命中」必须排在「大世界判定」之前: 拍卖界面本身也带小地图(在大世界
+        图层之上), `in_world` 可能为真。若先判大世界就会把已在拍卖界面的用户再走一遍
+        F5 流程。这里让 in_world 返回 True, 断言它不被查询。
+        """
+        task = self._task(in_auction=True, world=True)
+
+        task._ensure_auction_entry(Mock())
+
+        task.in_world.assert_not_called()
+        task._return_to_auction.assert_not_called()
+
+    def test_world_start_triggers_recover(self):
+        """启动时人在大世界: 走回场路径进入拍卖界面。"""
+        task = self._task(in_auction=False, world=True)
+
+        task._ensure_auction_entry(Mock())
+
+        task._return_to_auction.assert_called_once()
+        # 回场预算与掉线回场一致。
+        deadline = task._return_to_auction.call_args.args[1]
+        self.assertEqual(deadline, self.clock.now + AutoBidAuctionTask.ENTRY_RECOVER_TIMEOUT)
+
+    def test_not_in_world_leaves_flow_alone(self):
+        """既不在拍卖界面也不在大世界时(登录页/加载页等)不接管, 交给原有流程报错。"""
+        task = self._task(in_auction=False, world=False)
+
+        task._ensure_auction_entry(Mock())
+
+        task._return_to_auction.assert_not_called()
+
+    def test_recover_failure_is_not_fatal(self):
+        """入口回场失败只记警告, 让第一轮按界面异常继续走既有失败路径。"""
+        task = self._task(in_auction=False, world=True)
+        task._return_to_auction = Mock(return_value=False)
+
+        task._ensure_auction_entry(Mock())
+
+        self.assertTrue(
+            any(
+                "启动回场未成功" in str(call.args[0])
+                for call in task.log_warning.call_args_list
+            )
+        )
+
+    def test_does_not_consume_round_recover_quota(self):
+        """入口回场发生在轮次之外, 不能吃掉「每轮掉线可回场一次」的配额。"""
+        task = self._task(in_auction=False, world=True)
+        task._recover_quota = AutoBidAuctionTask.RECOVER_MAX_PER_ROUND
+
+        task._ensure_auction_entry(Mock())
+
+        self.assertEqual(task._recover_quota, AutoBidAuctionTask.RECOVER_MAX_PER_ROUND)
+
+
 class TestAuctionReturnBudget(unittest.TestCase):
     """回场的每一步都必须受「剩余预算」约束, 不能走各处的默认超时。
 
@@ -2834,6 +2943,94 @@ class TestAuctionReturnBudget(unittest.TestCase):
             self.assertIsNotNone(time_out)
             self.assertLessEqual(time_out, 30)
             self.assertGreater(time_out, 0)
+
+
+class TestAuctionTimeoutConstants(unittest.TestCase):
+    """超时值必须是常量, 不能裸写数字。
+
+    裸数字的问题是「改一处漏一处」: 同一个语义在两处各写一遍 10, 日后有人调其中一处,
+    另一处静默不同步, 表现为「有时生效有时不生效」。所以凡是「有名字的等待」都应引用
+    常量, 只有循环前探测 deadline 这类一次性极小值可以裸写。
+
+    例外清单(白名单)按语义放行, 新增白名单项必须说明理由 —— 它们都是出价热路径上
+    刻意调短的独立超时, 语义与任何现有常量都不同, 强行提取只会造出无人复用的常量。
+    """
+
+    # 允许裸写的位置 -> (出现次数上限, 理由)。
+    #
+    # 记次数而不是单纯记「这个数字可以用」: 否则把某个常量改回裸数字时, 只要该数字
+    # 恰好也在白名单里就抓不出来 —— 变异验证实测过这个漏洞(把 WAREHOUSE_LOAD_TIMEOUT
+    # 改回裸 10, 因为白名单里有 10 而放行)。带上限后, 每次新增裸写都会让计数超标。
+    ALLOWED_BARE = {
+        # 循环体入口的 deadline 探测: 只要一个「还没到点」的判定, 不等待。
+        "0.1": (3, "deadline 探测, 一次性极小值"),
+        # 单帧/快检: 只确认当前帧的界面状态, 不需要等它变化。
+        "1": (1, "单帧快检(是否已在出售模式)"),
+        # 等出价按钮出现: 与 WAREHOUSE_LOAD_TIMEOUT 数值相同, 但一个是出价热路径、
+        # 一个是仓库加载, 合并会让两者被一起调歪。
+        "10": (1, "出价热路径等按钮出现"),
+        # 等控件出现: 与 ASSET_OCR_TIMEOUT 数值相同但场景不同(一个是等按钮、
+        # 一个是读资产), 借用会造成错误的耦合。
+        "15": (2, "各阶段等控件出现, 语义独立"),
+        # 找卡片 / 读价格文本的短超时。
+        "3": (2, "找卡片 / 读价格文本"),
+        # 出价热路径上的短超时: 等按钮/面板/界面离开, 每次出价都要走一遍, 给太长会拖慢。
+        "5": (6, "出价热路径的独立短超时"),
+    }
+
+    def _bare_timeout_calls(self) -> list[tuple[int, str]]:
+        """扫描源码, 返回所有以裸数字作超时的调用点 (行号, 数字文本)。"""
+        source = Path(auction_module.__file__).read_text(encoding="utf-8")
+        pattern = re.compile(
+            r"(?:_remaining_timeout|_bounded_timeout|_timeout_or_zero)\(deadline,\s*([0-9.]+)\s*\)"
+        )
+        found = []
+        for index, line in enumerate(source.splitlines(), start=1):
+            match = pattern.search(line)
+            if match:
+                found.append((index, match.group(1)))
+        return found
+
+    def test_timeout_calls_use_named_constants(self):
+        """所有超时调用要么引用常量, 要么在白名单里且没超过次数上限。"""
+        counts: dict[str, int] = {}
+        for _, value in self._bare_timeout_calls():
+            counts[value] = counts.get(value, 0) + 1
+
+        unknown = {
+            value: count
+            for value, count in counts.items()
+            if value not in self.ALLOWED_BARE
+        }
+        self.assertEqual(
+            unknown,
+            {},
+            f"这些超时值应提取成常量(或加入白名单并说明理由): {unknown}",
+        )
+
+        exceeded = {
+            value: (count, self.ALLOWED_BARE[value][0])
+            for value, count in counts.items()
+            if count > self.ALLOWED_BARE[value][0]
+        }
+        self.assertEqual(
+            exceeded,
+            {},
+            f"这些裸数字出现次数超过白名单上限(数值, 实际 vs 上限): {exceeded}",
+        )
+
+    def test_scan_actually_finds_the_known_call_sites(self):
+        """扫描本身要有判别力: 至少能找到那些已知的白名单点位。
+
+        否则正则写错(比如常量改成 self.XXX 后全部不匹配)时, 上一条用例会「零违规」
+        而永远通过 —— 变异验证时正是靠这条抓住的。
+        """
+        found = self._bare_timeout_calls()
+        self.assertGreaterEqual(len(found), 5)
+        values = {value for _, value in found}
+        # 白名单里的每类值都应真实存在, 不能是过期的残留名单。
+        for value in self.ALLOWED_BARE:
+            self.assertIn(value, values, f"白名单项 {value} 已不存在, 应删除")
 
 
 class TestAuctionEstimateEdgeMarginScaling(unittest.TestCase):

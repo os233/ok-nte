@@ -145,7 +145,7 @@ def _inst_line(text: str, color: str = "", *, bold: bool = False, indent: int = 
 INST = "<br>".join(
     [
         _inst_line("📍 使用前提", "#FF5555", bold=True),
-        _inst_line("在拍卖主界面选「低级会场」后启动; 「循环次数」填 0 = 一直运行", indent=1),
+        _inst_line("在大世界或拍卖主界面启动均可, 会自动进入; 「循环次数」填 0 = 一直运行", indent=1),
         _inst_line("掉线被踢回大世界时会自动回场(F5 都市大亨 → 都市闲趣 → 即刻落槌)", indent=1),
         _inst_line("💰 「出价模式」三选一", "#FF5555", bold=True),
         _inst_line(
@@ -431,6 +431,9 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
     # 关闭藏品仓库的重试次数。批量关闭失败会把「出售模式 + 已勾选品质」留给下一轮,
     # 下次进来会无条件再点一遍同一批品质(全部取反), 必须确认真的关掉了。
     WAREHOUSE_CLOSE_RETRIES = 3
+    # 藏品仓库入口与界面标题的等待上限。两者是同一段 UI 就绪过程(点入口 → 界面加载),
+    # 用同一个上限, 免得调一处漏一处。
+    WAREHOUSE_LOAD_TIMEOUT = 10
 
     # 结算界面的「一键出售」: 跳过动画刚点完, 按钮本来就该在, 给短超时即可.
     ONE_CLICK_SELL_TIMEOUT = 3
@@ -468,6 +471,10 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
     # 点击成功后界面切换只要 0.6 秒左右(见历史运行日志), 所以点击后短时间内按钮仍在原位
     # 就说明这次点击没有生效, 立刻重试比白等 MATCH_CLICK_TIMEOUT 划算得多.
     MATCH_PROBE_TIMEOUT = 3
+    # 等待「确认出价」后的出价界面加载完成。与 BID_RESULT_TIMEOUT 数值相同但语义不同:
+    # 那个是等「一次出价的结果」(见 _stage_bid_loop), 这个是等界面渲染出来, 不要合并。
+    BID_SCREEN_TIMEOUT = 60
+    # 等一次出价的结果: 在这段时间内看界面是变成「已结束」还是「被加价」。
     BID_RESULT_TIMEOUT = 60
     # 结算阶段实测最长 3.9 秒(207 次样本), 这个上限从未触发过, 保留用于界面卡死时兜底;
     # 注意 RESULT_MAX_LOOPS(180) x POLL_INTERVAL(0.5) 恰好也是 90 秒, 两个条件同时到点.
@@ -524,6 +531,10 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
     # _stage_match」的路径上被默认值恢复, 使同一轮可以反复回场, 每次都重走一遍面板动画
     # 把整轮 deadline 耗光, 并且让「本轮只回场一次」这个约定形同虚设。
     RECOVER_MAX_PER_ROUND = 1
+    # 启动时的入口回场(见 _ensure_auction_entry): 探测主界面标题的等待上限,
+    # 以及一次性回场预算。预算与 RECOVER_TIMEOUT 一致, 两者走的是同一条路径。
+    ENTRY_PROBE_TIMEOUT = 3
+    ENTRY_RECOVER_TIMEOUT = 90
     # 匹配阶段每 N 次轮询探一次大世界(约 2 秒): in_world 是旋转模板匹配, 比 OCR 贵,
     # 不能每 0.5 秒调一次; 探测只在点击「开始匹配」之后、界面迟迟不变化时才开始.
     WORLD_PROBE_INTERVAL = 4
@@ -532,7 +543,7 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         super().__init__(*args, **kwargs)
         self.supported_languages = ["zh_CN"]
         self.name = "自动拍卖(目前仅支持简中)"
-        self.description = "在拍卖主界面, 选择低级会场后开始; 请先阅读「说明」"
+        self.description = "可从大世界或拍卖主界面直接启动, 会自动进入拍卖界面; 请先阅读「说明」"
         self.group_name = "都市闲趣"
         # 任务卡上的「说明」按钮只在 instructions 非空时出现, 内容是富文本 HTML.
         self.instructions = INST
@@ -825,6 +836,7 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
             self._warn_if_no_sellable_quality()
             self._warn_if_extra_sell_is_redundant()
             boxes = self._build_boxes()
+            self._ensure_auction_entry(boxes)
             while self.has_remaining_rounds():
                 if not self.begin_round():
                     break
@@ -1077,6 +1089,36 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
             popup_blank=screen(*self.BOX_POPUP_BLANK),
         )
 
+    # --- 任务入口回场 (大世界 → 拍卖主界面) ---
+    def _ensure_auction_entry(self, boxes: AuctionBoxes) -> None:
+        """启动时若人在大世界, 先按「大世界 → 即刻落槌」进入拍卖界面。
+
+        复用掉线回场的同一条路径(_return_to_auction), 不新增识别或导航代码:
+        用户从大世界直接启动时, 原来的第一轮只能在 _stage_match 里空转到
+        MATCH_TIMEOUT(120 秒) 由末尾的大世界兜底触发回场, 首轮白等约一分钟.
+
+        判定顺序: 先读拍卖主界面标题, 命中即已在拍卖界面, 直接开跑;
+        未命中再判大世界 —— 不在大世界就不接管, 交给原有流程按界面异常报错,
+        避免在登录页/加载页等未知界面上误触发 F5 流程.
+
+        本方法在 start_rounds 之后、begin_round 之前执行, 不消耗轮次内的
+        `_recover_quota`(该配额每轮由 _exec_auction_round 重置), 因此不影响
+        「每轮掉线可回场一次」的既有约定.
+        """
+        if self.wait_ocr(
+            box=boxes.main_title,
+            match=RE_MAIN_TITLE,
+            time_out=self.ENTRY_PROBE_TIMEOUT,
+            raise_if_not_found=False,
+        ):
+            return
+        if not self._is_world_screen():
+            return
+        self.log_info("启动时检测到大世界, 自动进入「即刻落槌」")
+        self.info_set("当前阶段", "入场中")
+        if not self._return_to_auction(boxes, time.monotonic() + self.ENTRY_RECOVER_TIMEOUT):
+            self.log_warning("启动回场未成功, 交给第一轮按界面异常处理")
+
     def _run_single_round(self, boxes: AuctionBoxes) -> None:
         """执行一轮拍卖, 记录结果并仅在确认回到主界面后触发出售。"""
         # 结算后处理会把本轮的满仓与低保金结果写回, 每轮开始前先清空上一轮的观测.
@@ -1188,7 +1230,7 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         self.log_info("等待进入出价界面")
         ready = self.wait_until(
             lambda: self._is_bid_screen(boxes),
-            time_out=self._remaining_timeout(deadline, 60),
+            time_out=self._remaining_timeout(deadline, self.BID_SCREEN_TIMEOUT),
             settle_time=0.5,
             post_action=lambda: self.sleep(0.5),
             raise_if_not_found=False,
@@ -2835,7 +2877,7 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
             warehouse_button = self._wait_operate_click(
                 boxes.warehouse_btn,
                 RE_WAREHOUSE,
-                self._bounded_timeout(deadline, 10),
+                self._bounded_timeout(deadline, self.WAREHOUSE_LOAD_TIMEOUT),
             )
             if not warehouse_button:
                 self.log_warning("藏品仓库入口未出现, 取消出售流程")
@@ -2846,7 +2888,7 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
             if not self.wait_ocr(
                 box=boxes.warehouse_title,
                 match=RE_WAREHOUSE,
-                time_out=self._bounded_timeout(deadline, 10),
+                time_out=self._bounded_timeout(deadline, self.WAREHOUSE_LOAD_TIMEOUT),
                 raise_if_not_found=False,
                 settle_time=0.5,
             ):
