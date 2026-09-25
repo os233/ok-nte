@@ -1622,12 +1622,51 @@ class TestAuctionSellFailureEscalation(unittest.TestCase):
 
     def test_success_resets_the_failure_counter(self):
         task = self._task([False, True])
-        task._sell_failures = 3
+        task._sell_failures = AutoBidAuctionTask.SELL_FAILURE_ESCALATE_AFTER - 1
         task._inventory_stuck = True
 
         self.assertTrue(
             task._sell_collections_with_escalation(Mock(), None, (), inventory_full=True)
         )
+        self.assertEqual(task._sell_failures, 0)
+        self.assertFalse(task._inventory_stuck)
+
+    def test_reaching_the_threshold_starts_with_the_escalated_set(self):
+        """计数已达阈值时直接用放宽集合开局, 不再先白试一次未放宽的。
+
+        满仓时第一次调用就可能耗尽出售预算并抛异常, 若仍先试一次未放宽的, 放宽分支
+        永远走不到, 计数累到阈值也没有用。
+        """
+        task = self._task([True])
+        task._sell_failures = AutoBidAuctionTask.SELL_FAILURE_ESCALATE_AFTER
+        task._inventory_stuck = True
+
+        self.assertTrue(
+            task._sell_collections_with_escalation(Mock(), None, (), inventory_full=True)
+        )
+        self.assertEqual(task._sell_collections.call_count, 1)
+        self.assertEqual(
+            set(task._sell_collections.call_args.args[2]),
+            set(AutoBidAuctionTask.QUALITY_KEYS),
+        )
+        self.assertEqual(task._sell_failures, 0)
+        self.assertFalse(task._inventory_stuck)
+
+    def test_sell_timeout_does_not_feed_the_escalation_counter(self):
+        """出售超出预算时结果未知, 既不计入放宽计数也不置 _inventory_stuck。
+
+        超时点无法区分在「确认出售」之前还是之后: 收尾的 _bounded_sleep 在点完
+        confirm_sell 之后也会抛, 那次出售可能已经生效。误计会让放宽提前触发(卖掉用户
+        明确保留的品质), 误置 _inventory_stuck 会让下一轮跳过拍卖并记一次失败。
+        """
+        task = self._task([WaitFailedException("藏品出售超出预算")])
+        task._sell_failures = 0
+        task._inventory_stuck = False
+
+        with self.assertRaises(WaitFailedException):
+            task._sell_collections_with_escalation(Mock(), None, (), inventory_full=True)
+
+        self.assertEqual(task._sell_collections.call_count, 1)
         self.assertEqual(task._sell_failures, 0)
         self.assertFalse(task._inventory_stuck)
 

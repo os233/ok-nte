@@ -1519,12 +1519,20 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
 
         self.log_debug(f"当前资产值为 {asset_value}, 继续执行出价")
 
-        self.log_info("等待出价按钮")
-        found = self._wait_operate_click(
-            boxes.bid,
-            RE_BID,
-            self._remaining_timeout(deadline, 10),
-        )
+        # 数字键盘已经弹出时 BOX_BID 被弹窗盖住(实测该框 all_boxes 全空), 在 boxes.bid 上
+        # 等 RE_BID 只会等到超时, 于是 _input_fixed_price 永远走不到. 面板已就绪时直接跳过
+        # 出价按钮, 否则保持原有等待与点击路径.
+        keypad_open = bool(self.ocr(box=boxes.bid_keypad, match=RE_BID_PANEL))
+        if keypad_open:
+            self.log_info("数字面板已打开, 跳过出价按钮")
+            found = True
+        else:
+            self.log_info("等待出价按钮")
+            found = self._wait_operate_click(
+                boxes.bid,
+                RE_BID,
+                self._remaining_timeout(deadline, 10),
+            )
         if not found:
             self.log_warning("出价按钮未出现, 准备重试本次出价")
             raise WaitFailedException("出价按钮未出现")
@@ -1955,6 +1963,18 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
             return float(self.config.get(key, default))
         except (TypeError, ValueError):
             return default
+
+    def _config_decimal(self, key: str, default: str = "0") -> Decimal:
+        """读取十进制配置, 非法时回退到默认值。
+
+        用于参与 Decimal 运算的配置(加价数值): 配置原值本身就是文本框里的字符串,
+        直接解析能保留用户填的全部精度, 而先经 float 中转再 str() 只剩 17 位有效数字。
+        非法值一律回退默认值, 与 _config_float 一样不抛异常 —— 调用方另有兜底。
+        """
+        try:
+            return Decimal(str(self.config.get(key, default)))
+        except (ArithmeticError, ValueError):
+            return Decimal(default)
 
     def _config_int_list(self, key: str) -> list[int]:
         """读取整数列表配置, 任一项非法时返回空列表。"""
@@ -2517,7 +2537,7 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         价格永远算不出来, 却看不到真正的原因。
         """
         mode = self._raise_mode()
-        value = self._config_float(self.CONF_RAISE_VALUE, 0.0)
+        value = self._config_decimal(self.CONF_RAISE_VALUE, "0")
         raise_round = self._config_int(self.CONF_RAISE_ROUND, 0)
 
         # 在达到配置的加价回合前使用基础价.
@@ -2530,16 +2550,15 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         # 根据所选方式计算价格.
         try:
             base = Decimal(str(base_price))
-            factor = Decimal(str(value))
             if mode == self.RAISE_MODE_MULTIPLE:
                 # 指数增长: 基础价 * (倍率 ^ offset).
-                result = base * (factor**offset)
+                result = base * (value**offset)
             elif mode == self.RAISE_MODE_PERCENT:
                 # 线性增长: 基础价 * (1 + 百分比 / 100 * offset).
-                result = base * (Decimal(1) + factor / 100 * offset)
+                result = base * (Decimal(1) + value / 100 * offset)
             else:  # 自定义
                 # 线性增长: 基础价 + 自定义值 * offset.
-                result = base + factor * offset
+                result = base + value * offset
             # 量化必须留在 try 内: Decimal 的指数范围极大, `10 ** 400` 仍是有限值,
             # is_finite() 拦不住; 但它有 405 位有效数字, 超过默认上下文精度 28,
             # 到这一步 quantize 才抛 InvalidOperation。放在 try 外等于把
@@ -3056,8 +3075,38 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         几次后放宽」, 若非满仓的抖动也计入, 阈值会被历史抖动提前填满, 之后满仓的
         第一次失败就立刻放宽, 把用户明确保留的品质一起卖掉(实测: 非满仓失败 5 次后,
         紧接一次满仓失败即触发, escalated 集合是 6 个品质全卖)。
+
+        出售超时(预算耗尽, _sell_collections 抛 WaitFailedException)**不**计入失败:
+        超时点无法区分是在「确认出售」之前还是之后 —— 收尾的 _bounded_sleep 在点完
+        confirm_sell 之后也会抛, 那次出售可能已经生效。把这种「结果未知」当成满仓失败
+        会连累两处: 放宽品质(可能卖掉用户明确保留的品质)被提前触发, 且 _inventory_stuck
+        一旦被误置, 下一轮会直接跳过拍卖并记一次失败(见 _run_single_round), 仓库其实
+        已空时还会反复触发。所以只有拿到「读数为 0 / 未勾选」这类明确失败证据才累积计数。
+
+        计数达到阈值后以放宽集合开局(use_escalated): 否则第一次调用就超时的话,
+        放宽分支永远走不到。
         """
-        if self._sell_collections(boxes, deadline, extra_sell, require_sale=inventory_full):
+        escalated = sorted(set(extra_sell) | set(self.QUALITY_KEYS))
+        # 已经达到放宽阈值时直接用放宽集合开局: 满仓耗尽 SELL_TIMEOUT 会让第一次调用就抛
+        # 异常, 永远走不到下面的放宽分支, 计数累到阈值也没有用.
+        use_escalated = inventory_full and self._sell_failures >= self.SELL_FAILURE_ESCALATE_AFTER
+        if use_escalated:
+            self.log_warning(f"藏品出售已连续 {self._sell_failures} 次未完成, 直接放宽保留品质")
+
+        try:
+            sold = self._sell_collections(
+                boxes,
+                deadline,
+                escalated if use_escalated else extra_sell,
+                require_sale=inventory_full,
+            )
+        except WaitFailedException as e:
+            # 结果未知, 不动计数也不置 _inventory_stuck: 收尾的 _bounded_sleep 在点完
+            # confirm_sell 之后也会抛, 那次出售可能已经生效. 误置 _inventory_stuck 会让
+            # 下一轮跳过拍卖并记一次失败, 而仓库其实已空时还会反复触发.
+            self.log_warning(f"藏品出售超出预算, 结果未知, 不计入放宽计数: {e}")
+            raise
+        if sold:
             self._sell_failures = 0
             self._inventory_stuck = False
             return True
@@ -3069,14 +3118,23 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
             return False
 
         self._sell_failures += 1
-        if self._sell_failures < self.SELL_FAILURE_ESCALATE_AFTER:
+        if self._sell_failures < self.SELL_FAILURE_ESCALATE_AFTER or use_escalated:
+            # 本次已经是放宽后的尝试, 不再重复放宽一次.
             self.log_warning(f"藏品出售未完成 (满仓连续 {self._sell_failures} 次)")
             self._inventory_stuck = inventory_full
             return False
 
         self.log_warning(f"藏品出售连续 {self._sell_failures} 次未完成, 放宽保留品质重试一次")
-        escalated = sorted(set(extra_sell) | set(self.QUALITY_KEYS))
-        if self._sell_collections(boxes, deadline, escalated, require_sale=True):
+        try:
+            escalated_sold = self._sell_collections(
+                boxes, deadline, escalated, require_sale=True
+            )
+        except WaitFailedException as e:
+            # 同上一处: 放宽后的这次出售是否生效同样无法确认, 保持计数与 _inventory_stuck
+            # 不变, 交给下一轮的实测结论决定.
+            self.log_warning(f"放宽保留品质后的出售超出预算, 结果未知: {e}")
+            raise
+        if escalated_sold:
             self.log_info("放宽保留品质后出售成功")
             self._sell_failures = 0
             self._inventory_stuck = False
