@@ -61,18 +61,21 @@ class CinemaDateTask(NTEOneTimeTask, BaseNTETask):
         return bool(self.wait_until(self.is_in_team, post_action=post, time_out=30))
 
     def _tp_to_cinema(self):
-        self.open_f1_domain_page()
-        self.sleep(0.5)
-        self.operate_click(0.90, 0.15)
-        self.sleep(0.5)
-        self.operate(
-            lambda: self.scroll_relative(0.5, 0.5, -40),
-            block=True,
-        )
-        self.sleep(0.5)
-        self.operate_click(0.862, 0.780)
-        self.sleep(0.5)
-        self.click_traval_button()
+        def action():
+            self.open_f1_domain_page()
+            self.sleep(0.5)
+            self.operate_click(0.90, 0.15)
+            self.sleep(0.5)
+            self.operate(
+                lambda: self.scroll_relative(0.5, 0.5, -40),
+                block=True,
+            )
+            self.sleep(0.5)
+            self.operate_click(0.862, 0.780)
+            self.sleep(0.5)
+            return self.click_traval_button(raise_if_not_found=False)
+
+        self.retry_on_action(action=action, reset_action=self.ensure_main, raise_if_failed=True)
         self.ensure_main(esc=False, time_out=300)
 
     def _go_to_front_desk(self):

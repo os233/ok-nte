@@ -20,11 +20,9 @@ class Haniel(Support):
         skill = self.click_skill_action()
 
         def entry():
-            ultimate_result = yield ultimate
-            if ultimate_result:
+            if (yield ultimate):
                 self.sleep(0.3)
-            skill_result = yield skill
-            if skill_result:
+            if (yield skill):
                 self.sleep(0.3)
 
         return self.plan(ultimate, skill, entry=entry)

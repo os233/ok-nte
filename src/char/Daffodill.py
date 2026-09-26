@@ -27,8 +27,7 @@ class Daffodill(BaseChar):
         claims = self.set_claims()
 
         def entry():
-            ultimate_result = yield ultimate
-            if ultimate_result:
+            if (yield ultimate):
                 self._perform_burst(context, skill)
                 return
             yield skill

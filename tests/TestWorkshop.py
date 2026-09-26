@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import requests
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QWidget
 
 from src.char.core.CharRegistry import char_registry
@@ -512,3 +513,35 @@ class TestWorkshop(unittest.TestCase):
         finally:
             dialog.deleteLater()
             parent.deleteLater()
+
+    def test_workshop_dialog_layout_stability_and_no_shadow(self):
+        pkg1 = TeamPackage("A", "Desc 1", "Author A", "1.0.0", self._package(False).slots)
+        pkg2 = TeamPackage(
+            "B", "Multi\nLine\nDescription\nHere", "Author B", "2.0.0", self._package(False).slots
+        )
+        e1 = CatalogEntry(pkg1, "codes/a.zip", "a.zip", 100, "2026-01-01T00:00:00Z")
+        e2 = CatalogEntry(pkg2, "codes/b.zip", "b.zip", 200, "2026-01-02T00:00:00Z")
+        parent = QWidget()
+        with patch.object(WorkshopDialog, "reload_catalog"):
+            dialog = WorkshopDialog(Mock(), parent)
+        try:
+            self.assertIsNone(dialog.widget.graphicsEffect())
+            self.assertEqual(
+                dialog.table.horizontalScrollBarPolicy(), Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            )
+            self.assertTrue(dialog.table.horizontalHeader().stretchLastSection())
+
+            dialog._catalog_loaded(([e1, e2], IndexSource("GitHub", "index", "base")))
+            dialog.show()
+            self.qt_app.processEvents()
+
+            w_geom_0 = dialog.widget.geometry()
+            t_geom_0 = dialog.table.geometry()
+            dialog.table.selectRow(1)
+            self.qt_app.processEvents()
+            self.assertEqual(dialog.widget.geometry(), w_geom_0)
+            self.assertEqual(dialog.table.geometry(), t_geom_0)
+        finally:
+            dialog.deleteLater()
+            parent.deleteLater()
+

@@ -332,6 +332,8 @@ class WorkshopDialog(MessageBoxBase):
         self.table.setColumnWidth(3, 80)
         self.table.verticalHeader().hide()
         self.table.verticalHeader().setDefaultSectionSize(34)
+        self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.table.horizontalHeader().setStretchLastSection(True)
         split_layout.addWidget(self.table, 3)
 
         # Right: detail panel (fixed width avoids relayout jitter on selection)
@@ -381,6 +383,7 @@ class WorkshopDialog(MessageBoxBase):
 
         self.viewLayout.addLayout(split_layout, 1)
 
+        self.widget.setGraphicsEffect(None)
         self.widget.setMinimumSize(1100, 600)
         self.yesButton.hide()
         self.cancelButton.setText(self.tr("关闭"))

@@ -635,8 +635,22 @@ msgstr "Selecionar svcl.exe"
 msgid "Open Download Page"
 msgstr "Abrir página de download"
 
-msgid "⚠️ 正在运行{rob_mode}\n该模式会高频占用/争夺鼠标。如需停止，请使用热键暂停 ok-nte, 再手动停止任务。\n当前热键: {hotkey} (如无法确认当前热键则点击取消, 主动确认后再运行)"
-msgstr "⚠️ Executando {rob_mode}\nEste modo ocupará/disputará o mouse em alta frequência. Para parar, use a tecla de atalho para pausar o ok-nte e depois pare a tarefa manualmente.\nTecla de atalho atual: {hotkey} (se não puder confirmar a tecla de atalho atual, clique em cancelar e execute após confirmar manualmente)"
+msgid ""
+"即将运行: {mode}\n"
+"\n"
+"此任务会频繁控制鼠标。\n"
+"停止方法: 按热键暂停 ok-nte, 再手动停止任务。\n"
+"\n"
+"当前热键: {hotkey}\n"
+"如不确定热键, 请点击取消, 确认后再运行。"
+msgstr ""
+"⚠️ Prestes a executar: {mode}\n"
+"\n"
+"Esta tarefa controlará o mouse com frequência.\n"
+"Para parar: pressione a tecla de atalho para pausar o ok-nte e depois pare a tarefa manualmente.\n"
+"\n"
+"Tecla de atalho atual: {hotkey}\n"
+"Se não souber qual é a tecla de atalho, clique em Cancelar, confirme-a e depois execute a tarefa."
 
 msgid "赤龙古堡-残丝长巷篝火"
 msgstr "Castelo do Dragão Vermelho - Fogueira do Beco da Seda"
@@ -828,11 +842,6 @@ msgstr "Check-in"
 msgid "捞币"
 msgstr "Pegar moedas"
 
-msgid ""
-"导入数据会完整覆盖当前用户资料.\n"
-"导出数据会导出完整用户资料."
-msgstr "A importação de dados substituirá completamente os perfis de usuário atuais.\nA exportação de dados exportará perfis de usuário completos."
-
 msgid "资料管理"
 msgstr "Gerenciamento de Dados"
 
@@ -971,9 +980,6 @@ msgstr "<p>Configure e salve formações e combos de equipe de 4 personagens, co
 msgid "OpenVINO 单次推理超时，已自动关闭目标检测；重启程序后会重新尝试启用。"
 msgstr "O tempo de inferência única do OpenVINO esgotou, a detecção de alvos foi desativada automaticamente. Será tentada a reativação ao reiniciar o programa."
 
-msgid "管理"
-msgstr "Gerenciar"
-
 msgid "批量删除"
 msgstr "Exclusão em Lote"
 
@@ -1012,9 +1018,6 @@ msgstr "Falha ao Aplicar Código Externo"
 
 msgid "已应用外置代码: {}"
 msgstr "Código externo aplicado: {}"
-
-msgid "手动添加或修改 Python 代码后, 需点击 [{refresh}] 以生效. 关于编写角色出招表的指南, 请参考 <a href='{doc_url}'>文档</a>."
-msgstr "Depois de adicionar ou modificar o código Python manualmente, clique em [{refresh}] para aplicar. Para obter orientações sobre como criar combos de personagens, consulte a <a href='{doc_url}'>documentação</a>."
 
 msgid "角色"
 msgstr "Personagem"
@@ -1198,3 +1201,27 @@ msgstr "Ativar prioridade de início de combate"
 
 msgid "关闭时不按角色执行开战首切"
 msgstr "Quando desativado, a troca inicial de personagem no início do combate não é realizada"
+
+msgid "鼠标占用警告"
+msgstr "Aviso de controle do mouse"
+
+msgid "数据备份"
+msgstr "Backup de Dados"
+
+msgid "用户数据"
+msgstr "Dados do Usuário"
+
+msgid "ZIP 格式备份; 导入将覆盖当前数据"
+msgstr "Backup em formato ZIP; a importação substituirá os dados atuais"
+
+msgid "手动修改 Python 代码后, 需点击 [{refresh}] 生效"
+msgstr "Depois de modificar o código Python manualmente, clique em [{refresh}] para aplicar."
+
+msgid "编写指南"
+msgstr "Guia de Criação"
+
+msgid "噗卡乐园 - 命中幸运星"
+msgstr "Puka Land - Acertar a Estrela da Sorte"
+
+msgid "在可进行NPC交互的位置启动任务"
+msgstr "Inicie a tarefa em um local onde a interação com NPC esteja disponível"

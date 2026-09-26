@@ -1,8 +1,7 @@
 import time
 
-from ok import TaskDisabledException, WaitFailedException, og
+from ok import TaskDisabledException, WaitFailedException
 
-from src.events import ConfirmationRequested, communicate
 from src.tasks.NTEOneTimeTask import NTEOneTimeTask
 from src.tasks.RecordTask import RecordTask
 from src.ui.task_icons import Icon
@@ -43,12 +42,6 @@ EN_RECORD_INS = (
     "1. Scroll until [Target Level] is visible (if it already is, click [Target Level]).\n"
     "2. Click [Target Level]\n\n"
     "※ Do not click [Start Business]."
-)
-
-ROB_MODE_HINT = (
-    "⚠️ 正在运行{rob_mode}\n"
-    "该模式会高频占用/争夺鼠标。如需停止，请使用热键暂停 ok-nte, 再手动停止任务。\n"
-    "当前热键: {hotkey} (如无法确认当前热键则点击取消, 主动确认后再运行)"
 )
 
 
@@ -114,19 +107,9 @@ class OwnerSelectionTask(NTEOneTimeTask, RecordTask):
 
     def do_run(self):
         if self.config.get(self.CONF_ROB):
-            try:
-                hotkey = og.executor.basic_options.get("Start/Stop")
-            except Exception:
-                hotkey = "--"
-            confirmation = ConfirmationRequested(
-                self.tr(self.name),
-                self.tr(ROB_MODE_HINT).format(rob_mode=self.tr(self.CONF_ROB), hotkey=hotkey),
-                rich_text=False,
-                hide_cancel=False,
-                close_delay_seconds=2,
-            )
-            communicate.confirmation_requested.emit(confirmation)
-            if not confirmation.wait_for_response():
+            if not self.confirm_mouse_control_warning(
+                mode=self.tr(self.CONF_ROB), close_delay_seconds=2
+            ):
                 return
         self.start_rounds()
 

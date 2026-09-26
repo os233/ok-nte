@@ -63,10 +63,16 @@ class CharHubTab(CustomTab):
         if widget:
             self.pivot.setCurrentItem(widget.objectName())
 
+    def navigate_to_workshop(self) -> None:
+        self.stacked_widget.setCurrentWidget(self.team_manager_tab)
+        self.pivot.setCurrentItem(self.team_manager_tab.objectName())
+        if hasattr(self.team_manager_tab, "navigate_to_workshop"):
+            self.team_manager_tab.navigate_to_workshop()
+
     def set_separator_color(self, theme=None):
         color = "rgba(255, 255, 255, 0.1)" if isDarkTheme() else "rgba(0, 0, 0, 0.1)"
         self.separator.setStyleSheet(f"background-color: {color}; border: none;")
 
     @property
-    def name(self): # type: ignore
+    def name(self):  # type: ignore
         return self.tr_name_tab

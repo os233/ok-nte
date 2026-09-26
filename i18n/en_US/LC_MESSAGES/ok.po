@@ -892,13 +892,21 @@ msgid "Open Download Page"
 msgstr "Open Download Page"
 
 msgid ""
-"⚠️ 正在运行{rob_mode}\n"
-"该模式会高频占用/争夺鼠标。如需停止，请使用热键暂停 ok-nte, 再手动停止任务。\n"
-"当前热键: {hotkey} (如无法确认当前热键则点击取消, 主动确认后再运行)"
+"即将运行: {mode}\n"
+"\n"
+"此任务会频繁控制鼠标。\n"
+"停止方法: 按热键暂停 ok-nte, 再手动停止任务。\n"
+"\n"
+"当前热键: {hotkey}\n"
+"如不确定热键, 请点击取消, 确认后再运行。"
 msgstr ""
-"⚠️ Running {rob_mode}\n"
-"This mode will occupy/fight for the mouse at high frequency. To stop, use the hotkey to pause ok-nte, then manually stop the task.\n"
-"Current hotkey: {hotkey} (if you cannot confirm the current hotkey, click cancel and run after confirming manually)"
+"⚠️ About to run: {mode}\n"
+"\n"
+"This task will control the mouse frequently.\n"
+"To stop: press the hotkey to pause ok-nte, then stop the task manually.\n"
+"\n"
+"Current hotkey: {hotkey}\n"
+"If you are unsure of the hotkey, click Cancel, confirm it, then run the task."
 
 msgid "赤龙古堡-残丝长巷篝火"
 msgstr "Red Dragon Castle - Silken Alley Checkpoint"
@@ -1097,11 +1105,6 @@ msgstr "Check in"
 msgid "捞币"
 msgstr "Scoop Coins"
 
-msgid ""
-"导入数据会完整覆盖当前用户资料.\n"
-"导出数据会导出完整用户资料."
-msgstr "Importing data will completely overwrite current user profiles.\nExporting data will export complete user profiles."
-
 msgid "资料管理"
 msgstr "Data Management"
 
@@ -1240,9 +1243,6 @@ msgstr "<p>Configure and save common 4-character team lineups and combos, effect
 msgid "OpenVINO 单次推理超时，已自动关闭目标检测；重启程序后会重新尝试启用。"
 msgstr "OpenVINO single inference timed out, target detection has been automatically disabled. It will be re-enabled upon restarting the program."
 
-msgid "管理"
-msgstr "Manage"
-
 msgid "批量删除"
 msgstr "Batch Delete"
 
@@ -1284,9 +1284,6 @@ msgstr "Failed to Apply External Code"
 
 msgid "已应用外置代码: {}"
 msgstr "Applied external code: {}"
-
-msgid "手动添加或修改 Python 代码后, 需点击 [{refresh}] 以生效. 关于编写角色出招表的指南, 请参考 <a href='{doc_url}'>文档</a>."
-msgstr "After manually adding or modifying Python code, click [{refresh}] to take effect. For guidelines on writing character combos, please refer to the <a href='{doc_url}'>documentation</a>."
 
 msgid "角色"
 msgstr "Character"
@@ -1470,3 +1467,27 @@ msgstr "Enable Combat Start Priority"
 
 msgid "关闭时不按角色执行开战首切"
 msgstr "When disabled, initial character switch at combat start is not performed"
+
+msgid "鼠标占用警告"
+msgstr "Mouse Control Warning"
+
+msgid "数据备份"
+msgstr "Data Backup"
+
+msgid "用户数据"
+msgstr "User Data"
+
+msgid "ZIP 格式备份; 导入将覆盖当前数据"
+msgstr "ZIP backup; import will overwrite current data"
+
+msgid "手动修改 Python 代码后, 需点击 [{refresh}] 生效"
+msgstr "After manually modifying Python code, click [{refresh}] to take effect."
+
+msgid "编写指南"
+msgstr "Writing Guide"
+
+msgid "噗卡乐园 - 命中幸运星"
+msgstr "Puka Land - Hit the Lucky Star"
+
+msgid "在可进行NPC交互的位置启动任务"
+msgstr "Start the task at a location where NPC interaction is available"

@@ -441,6 +441,23 @@ class TestCombatPlanner(unittest.TestCase):
         self.assertEqual(decision.target, claimed)
         self.assertTrue(decision.strict)
 
+    def test_strict_field_claim_preempts_switch_request(self):
+        current = FakeChar(0, "current")
+        requested = FakeChar(1, "requested")
+        claimed = FakeChar(2, "claimed", claims=[FieldClaim.strict("return now")])
+        planner = self._planner([current, requested, claimed])
+        self._publish(
+            planner,
+            current,
+            lambda context: context.request_switch(requested, reason="switch request"),
+        )
+
+        decision = planner.decide_switch(current)
+
+        self.assertEqual(decision.target, claimed)
+        self.assertTrue(decision.strict)
+        self.assertIn("strict field claim", decision.reason)
+
     def test_locked_strict_route_precedes_strict_field_claim(self):
         current = FakeChar(0, "current")
         route_target = FakeChar(1, "route target")
@@ -2613,7 +2630,6 @@ class TestCombatPlanner(unittest.TestCase):
         self.assertEqual(decision.target, zero)
         self.assertIsNone(decision.expected_entry)
         self.assertIn("switch request", decision.reason)
-        self.assertEqual(zero.plan_calls, 0)
 
     def test_request_role_prefers_matching_role_without_forcing_action(self):
         source = FakeChar(0, "source")

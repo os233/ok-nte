@@ -21,8 +21,7 @@ class Fadia(BaseChar):
         skill = self.click_skill_action()
 
         def entry():
-            ultimate_result = yield ultimate
-            if not ultimate_result:
+            if not (yield ultimate):
                 yield skill
 
         return self.plan(ultimate, skill, entry=entry)

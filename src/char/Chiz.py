@@ -23,8 +23,7 @@ class Chiz(BaseChar):
         skill = self.click_skill_action()
 
         def entry():
-            ultimate_result = yield ultimate
-            if ultimate_result:
+            if (yield ultimate):
                 self.perform_in_ult()
             yield skill
 

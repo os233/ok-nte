@@ -311,20 +311,27 @@ class BaseChar:
         add_tags: set[Planner.ActionTag] | Planner.ActionTag | None = None,
         reason: str = "ultimate action available",
         can_execute=None,
+        send_click: bool = True,
+        wait_if_no_cd: float = 0,
     ):
         """创建一个 Q 动作声明。
 
         Args:
-            name: 动作名。默认 `"{角色名}_ultimate"`，用于日志和高级精确匹配。
-            tags: 动作标签。默认 `{Planner.ActionTag.ULTIMATE_ACTION}`。
-            reason: 切人/执行日志理由。
-            can_execute: 额外限制; 终结技不可用时禁止执行。
+            name: 动作名; 默认 `"{角色名}_ultimate"`, 用于日志和 planner 精确匹配。
+            tags: 替换默认动作标签; 默认为 `{Planner.ActionTag.ULTIMATE_ACTION}`。
+            add_tags: 在最终标签上追加一个或多个标签。
+            reason: planner 选择或执行此动作时使用的说明。
+            can_execute: 接收 planner context 的额外条件; 返回 False 时禁止执行。
+                终结技本身不可用时, 动作仍会被禁止。
+            send_click: 传给 `click_ultimate`; 为 True 时在终结技动画期间发送普通点击。
+            wait_if_no_cd: 传给 `click_ultimate`; 冷却尚未完成时最多等待的秒数。
 
         Behavior:
             - 自动设置 `slot=Planner.ActionSlot.ULTIMATE`。
             - `can_execute` 默认包含 `self.ultimate_available()`。
             - `priority_ready` 自动使用 `self.ultimate_available()`。
-            - `execute` 调用 `self.click_ultimate()`。
+            - `send_click` 和 `wait_if_no_cd` 传给 `self.click_ultimate(...)`。
+            - `execute` 调用 `self.click_ultimate(...)`。
             - planner 会自动用 `slot=ULTIMATE` 检查 reservation。
         """
 
@@ -339,7 +346,9 @@ class BaseChar:
         return self.planner_action(
             tags=tags,
             slot=Planner.ActionSlot.ULTIMATE,
-            execute=lambda context: self.click_ultimate(),
+            execute=lambda context: self.click_ultimate(
+                send_click=send_click, wait_if_no_cd=wait_if_no_cd
+            ),
             name=name,
             reason=reason,
             can_execute=lambda context: (
@@ -356,15 +365,25 @@ class BaseChar:
         reason: str = "skill action available",
         down_time: float = 0.01,
         can_execute=None,
+        post_sleep: float = 0,
+        has_animation: bool = False,
+        send_click: bool = True,
+        time_out: float = 0,
     ):
         """创建一个 E 动作声明。
 
         Args:
-            name: 动作名。默认 `"{角色名}_skill"`，用于日志和高级精确匹配。
-            tags: 动作标签。默认 `{Planner.ActionTag.SKILL_ACTION}`。
-            reason: 切人/执行日志理由。
-            down_time: 传给 `click_skill(down_time=...)` 的按下时间。
-            can_execute: 额外限制; 技能不可用时禁止执行。
+            name: 动作名; 默认 `"{角色名}_skill"`, 用于日志和 planner 精确匹配。
+            tags: 替换默认动作标签; 默认为 `{Planner.ActionTag.SKILL_ACTION}`。
+            add_tags: 在最终标签上追加一个或多个标签。
+            reason: planner 选择或执行此动作时使用的说明。
+            can_execute: 接收 planner context 的额外条件; 返回 False 时禁止执行。
+                技能本身不可用时, 动作仍会被禁止。
+            down_time: 传给 `click_skill`; 技能按键按下的持续秒数。
+            post_sleep: 传给 `click_skill`; 成功释放技能后额外等待的秒数。
+            has_animation: 传给 `click_skill`; 是否按带动画的技能处理。
+            send_click: 传给 `click_skill`; 是否在技能释放过程中发送普通点击。
+            time_out: 传给 `click_skill`; 等待技能释放的超时秒数。为 0 时使用内置默认值。
 
         Behavior:
             - 自动设置 `slot=Planner.ActionSlot.SKILL`。
@@ -385,7 +404,13 @@ class BaseChar:
         return self.planner_action(
             tags=tags,
             slot=Planner.ActionSlot.SKILL,
-            execute=lambda context: self.click_skill(down_time=down_time),
+            execute=lambda context: self.click_skill(
+                down_time=down_time,
+                post_sleep=post_sleep,
+                has_animation=has_animation,
+                send_click=send_click,
+                time_out=time_out,
+            ),
             name=name,
             reason=reason,
             can_execute=lambda context: (
@@ -730,7 +755,7 @@ class BaseChar:
         has_animation=False,
         send_click=True,
         time_out=0,
-    ):
+    ) -> bool:
         """尝试释放技能。
 
         Args:
@@ -1073,8 +1098,7 @@ class BaseChar:
         teammates = [c for c in self.task.chars if c is not None and c.index != self.index]
 
         return tuple(
-            next((c for c in teammates if isinstance(c, cls)), None)
-            for cls in char_classes
+            next((c for c in teammates if isinstance(c, cls)), None) for cls in char_classes
         )
 
     def get_teammates_by_role(self, role: Planner.Role) -> list["BaseChar"]:
@@ -1085,9 +1109,7 @@ class BaseChar:
         return [
             char
             for char in self.task.chars
-            if char is not None
-            and char.index != self.index
-            and char.describe_role().role == role
+            if char is not None and char.index != self.index and char.describe_role().role == role
         ]
 
     def find_element_reaction_target(self, char=None):

@@ -8,7 +8,7 @@ class Support(BaseChar):
             role=Planner.Role.SUPPORT,
             field_preference=Planner.FieldPreference.SUPPORT,
             max_field_time=1,
-            combat_start_priority=1
+            combat_start_priority=1,
         )
 
     def click_ultimate_action(
@@ -18,7 +18,13 @@ class Support(BaseChar):
         add_tags: set[Planner.ActionTag] | Planner.ActionTag | None = None,
         reason: str = "ultimate action available",
         can_execute=None,
+        send_click: bool = True,
+        wait_if_no_cd: float = 0,
     ):
+        """声明支持角色的 Q 动作, 默认附加 `ULTIMATE_ACTION` 和 `SUPPORT` 标签。
+
+        其余参数及执行行为与 `BaseChar.click_ultimate_action` 相同。
+        """
         tags = tags or {Planner.ActionTag.ULTIMATE_ACTION, Planner.ActionTag.SUPPORT}
         return super().click_ultimate_action(
             name=name,
@@ -26,6 +32,8 @@ class Support(BaseChar):
             add_tags=add_tags,
             reason=reason,
             can_execute=can_execute,
+            send_click=send_click,
+            wait_if_no_cd=wait_if_no_cd,
         )
 
     def click_skill_action(
@@ -36,13 +44,25 @@ class Support(BaseChar):
         reason: str = "skill action available",
         down_time: float = 0.01,
         can_execute=None,
+        post_sleep: float = 0,
+        has_animation: bool = False,
+        send_click: bool = True,
+        time_out: float = 0,
     ):
+        """声明支持角色的 E 动作, 默认附加 `SKILL_ACTION` 和 `SUPPORT` 标签。
+
+        其余参数及执行行为与 `BaseChar.click_skill_action` 相同。
+        """
         tags = tags or {Planner.ActionTag.SKILL_ACTION, Planner.ActionTag.SUPPORT}
         return super().click_skill_action(
             name=name,
             tags=tags,
             add_tags=add_tags,
             reason=reason,
-            down_time=down_time,
             can_execute=can_execute,
+            down_time=down_time,
+            post_sleep=post_sleep,
+            has_animation=has_animation,
+            send_click=send_click,
+            time_out=time_out,
         )

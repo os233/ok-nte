@@ -30,8 +30,7 @@ class Jiuyuan(BaseChar):
 
         def entry():
             yield ultimate
-            skill_result = yield skill
-            if not skill_result:
+            if not (yield skill):
                 yield bullets
 
         return self.plan(ultimate, skill, bullets, entry=entry)

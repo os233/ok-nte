@@ -87,6 +87,8 @@ def _create_dialog(
     from qfluentwidgets import Dialog
 
     dialog = Dialog(title, "", parent)
+    dialog.yesButton.setText(og.app.tr("OK"))
+    dialog.cancelButton.setText(og.app.tr("Cancel"))
     dialog.setContentCopyable(copyable)
     if hide_cancel:
         dialog.cancelButton.hide()

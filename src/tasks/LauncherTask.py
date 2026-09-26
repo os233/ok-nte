@@ -6,7 +6,7 @@ import psutil
 import win32con
 import win32gui
 import win32process
-from ok import TaskDisabledException, og
+from ok import FinishedException, TaskDisabledException, og
 from ok.util.process import execute, is_admin
 
 from src import GAME_EXE, LAUNCHER_EXE
@@ -83,44 +83,40 @@ class LauncherTask(BaseNTETask):
             return
 
         self.scene.set_logged_in(False)
-        launcher_proc = self._find_process(LAUNCHER_EXE)
-        self.log_info(f"Launcher process check: {self._format_process(launcher_proc)}")
-        if launcher_proc:
-            self.log_info("Launcher is already running; preparing launcher capture")
-            self._update_launcher_path(launcher_proc.get("exe"))
-            if not self._wait_for_process(LAUNCHER_EXE):
-                raise TaskDisabledException("Timed out waiting for launcher window")
-            self._capture_launcher()
-            if not self._click_start_game():
-                raise TaskDisabledException("Timed out waiting for launcher to minimize")
-            self._wait_for_game_and_capture()
-            return
-
-        launcher_path = self._get_launcher_path()
-        if not launcher_path:
-            self.log_error("Launcher path was not found in config or registry")
-            raise TaskDisabledException(
-                "Launcher path not found. Please set Launcher Path to a launcher executable"
-            )
-
-        self.log_info(f"Starting launcher from configured path: {launcher_path}")
-        if not execute(launcher_path):
-            self.log_error(f"Failed to start launcher from path: {launcher_path}")
-            raise TaskDisabledException(f"Invalid launcher path: {launcher_path}")
-
-        self.log_info("Game did not appear directly; waiting for launcher process")
-        if not self._wait_for_process(LAUNCHER_EXE, settle_window=True):
-            self.log_error("Timed out waiting for launcher process")
-            raise TaskDisabledException("Timed out waiting for launcher process")
-
-        launcher_proc = self._find_process(LAUNCHER_EXE)
-        self.log_info(f"Launcher process after start: {self._format_process(launcher_proc)}")
-        if launcher_proc:
-            self._update_launcher_path(launcher_proc.get("exe"))
+        self._prepare_launcher()
         self._capture_launcher()
         if not self._click_start_game():
             raise TaskDisabledException("Timed out waiting for launcher to minimize")
         self._wait_for_game_and_capture()
+
+    def _prepare_launcher(self):
+        launcher_proc = self._find_process(LAUNCHER_EXE)
+        self.log_info(f"Launcher process check: {self._format_process(launcher_proc)}")
+        if launcher_proc:
+            self.log_info("Launcher is already running")
+        else:
+            launcher_path = self._get_launcher_path()
+            if not launcher_path:
+                self.log_error("Launcher path was not found in config or registry")
+                raise TaskDisabledException(
+                    "Launcher path not found. Please set Launcher Path to a launcher executable"
+                )
+
+            self.log_info(f"Starting launcher from configured path: {launcher_path}")
+            if not execute(launcher_path):
+                self.log_error(f"Failed to start launcher from path: {launcher_path}")
+                raise TaskDisabledException(f"Invalid launcher path: {launcher_path}")
+
+        launcher_proc = self._wait_for_process(
+            LAUNCHER_EXE,
+            settle_window=launcher_proc is None,
+        )
+        if not launcher_proc:
+            self.log_error("Timed out waiting for launcher window")
+            raise TaskDisabledException("Timed out waiting for launcher window")
+
+        self.log_info(f"Launcher process ready: {self._format_process(launcher_proc)}")
+        self._update_launcher_path(launcher_proc.get("exe"))
 
     def _capture_game(self):
         self.log_info(
@@ -181,7 +177,7 @@ class LauncherTask(BaseNTETask):
                 self.log_warning(
                     f"Launcher frame was unavailable while checking launcher button {e}"
                 )
-                time.sleep(1)
+                self.sleep(1)
                 continue
 
             box = self.box_of_screen(0.644, 0.214, 0.784, 0.378)
@@ -247,6 +243,21 @@ class LauncherTask(BaseNTETask):
         self.log_info_gated(f"launcher_button color {per}", interval=10, changed=True)
         return per > 0.8
 
+    def _sleep_for_window_poll(self, seconds):
+        remaining = seconds
+        while remaining > 0:
+            self.executor.check_enabled(check_pause=False)
+            if self.executor.exit_event.is_set():
+                raise FinishedException()
+            if self.paused or self.executor.paused:
+                time.sleep(0.1)
+                continue
+
+            started = time.monotonic()
+            time.sleep(min(remaining, 0.1))
+            if not (self.paused or self.executor.paused):
+                remaining -= time.monotonic() - started
+
     def _ensure_launcher_visible(self):
         _, launcher_hwnd = self._find_process_window(LAUNCHER_EXE, require_title=True)
         if not launcher_hwnd:
@@ -260,8 +271,8 @@ class LauncherTask(BaseNTETask):
         return bool(win32gui.IsIconic(launcher_hwnd) or not win32gui.IsWindowVisible(launcher_hwnd))
 
     def _wait_for_game_and_capture(self, time_out=600, settle_window=True):
-        _attempt = 3
-        for i in range(_attempt):
+        attempts = 3
+        for attempt in range(attempts):
             self.log_info(f"Waiting for game process for up to {time_out}s")
             if not self._wait_for_process(GAME_EXE, time_out=time_out, settle_window=settle_window):
                 self.log_error("Timed out waiting for game process")
@@ -271,21 +282,18 @@ class LauncherTask(BaseNTETask):
                 self._capture_game()
                 break
             except Exception as e:
-                if str(e) == "Cannot find window":
-                    if i < _attempt:
-                        self.log_error(f"Cannot find window, attempt for {i + 1}/3")
-                        continue
-                    else:
-                        raise e
-                else:
-                    raise e
+                if str(e) != "Cannot find window" or attempt == attempts - 1:
+                    raise
+                self.log_warning(
+                    f"Cannot find game window, retrying capture ({attempt + 1}/{attempts})"
+                )
         time_out = 10
         deadline = time.time() + time_out
         while time.time() < deadline:
             if not self.executor.connected():
                 self.log_info("executor not connected try refresh")
                 self.executor.device_manager.refresh()
-                time.sleep(1.5)
+                self.sleep(1.5)
             else:
                 break
         else:
@@ -323,21 +331,22 @@ class LauncherTask(BaseNTETask):
                             f"Window for {exe_label} exists but is too small; "
                             f"hwnd={hwnd}, size={size[0]}x{size[1]}, elapsed={elapsed}s",
                         )
-                        self.sleep(1)
+                        self._sleep_for_window_poll(1)
                         continue
 
                     if settle_window:
                         if not self._wait_for_window_size_to_settle(
                             hwnd, exe_label, start, time_out
                         ):
-                            return False
+                            self._sleep_for_window_poll(1)
+                            continue
                         size = self._get_window_size(hwnd)
 
                     self.log_info(
                         f"Found process and window {exe_label}: "
                         f"{self._format_process(proc)}, hwnd={hwnd}, size={size[0]}x{size[1]}",
                     )
-                    return True
+                    return proc
 
             elapsed = int(time.time() - start)
             if proc:
@@ -348,36 +357,46 @@ class LauncherTask(BaseNTETask):
                 self.log_info(
                     f"Still waiting for {exe_label}; elapsed={elapsed}s",
                 )
-            self.sleep(1)
+            self._sleep_for_window_poll(1)
         self.log_warning(f"Process/window {exe_label} was not found within {time_out}s")
-        return False
-
-    def _find_process(self, exe_name):
-        exe_names = {name.lower() for name in _exe_name_list(exe_name)}
-        if not exe_names:
-            return None
-        for proc in psutil.process_iter(["pid", "name", "exe"]):
-            try:
-                name = proc.info.get("name") or ""
-                if name.lower() in exe_names:
-                    return proc.info
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
         return None
 
-    def _find_process_window(self, exe_name, require_title=False):
-        proc = self._find_process(exe_name)
-        if not proc:
-            return None, 0
+    def _find_process(self, exe_name):
+        proc, _ = self._find_process_window(exe_name)
+        return proc
 
+    def _find_process_window(self, exe_name, require_title=False):
+        exe_names = {name.lower() for name in _exe_name_list(exe_name)}
+        if not exe_names:
+            return None, 0
         capture_config = (
             self.capture_config.GAME_CAPTURE_CONFIG
-            if exe_name == GAME_EXE
+            if GAME_EXE.lower() in exe_names
             else self.capture_config.LAUNCHER_CAPTURE_CONFIG
         )["windows"]
-        return proc, self._find_window_for_process(
-            proc, hwnd_class=capture_config["hwnd_class"], require_title=require_title
-        )
+
+        first_process = None
+        for process in psutil.process_iter(["pid", "name", "exe"]):
+            try:
+                proc = process.info
+                name = (proc.get("name") or "").lower()
+                if name not in exe_names:
+                    continue
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+
+            if first_process is None:
+                first_process = proc
+            hwnd = self._find_window_for_process(
+                proc,
+                hwnd_class=capture_config["hwnd_class"],
+                require_title=require_title,
+            )
+            if hwnd:
+                return proc, hwnd
+
+        # Keep detecting a starting process while its main window is not ready yet.
+        return first_process, 0
 
     def _find_window_for_process(self, proc_info, hwnd_class=None, require_title=False):
         pid = proc_info.get("pid")
@@ -456,7 +475,7 @@ class LauncherTask(BaseNTETask):
                 f"size={size[0]}x{size[1]}, stable_for={stable_for:.1f}s/{settle_time}s",
                 interval=2,
             )
-            self.sleep(0.5)
+            self._sleep_for_window_poll(0.5)
 
         self.log_warning(f"Timed out while waiting for {exe_name} window size to settle")
         return False

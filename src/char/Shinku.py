@@ -24,8 +24,7 @@ class Shinku(BaseChar):
 
         def entry():
             yield skill
-            ultimate_result = yield ultimate
-            if ultimate_result:
+            if (yield ultimate):
                 self.perform_in_ult(context)
 
         return self.plan(skill, ultimate, entry=entry)

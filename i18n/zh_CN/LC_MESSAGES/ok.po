@@ -888,9 +888,13 @@ msgid "Open Download Page"
 msgstr "打开下载页面"
 
 msgid ""
-"⚠️ 正在运行{rob_mode}\n"
-"该模式会高频占用/争夺鼠标。如需停止，请使用热键暂停 ok-nte, 再手动停止任务。\n"
-"当前热键: {hotkey} (如无法确认当前热键则点击取消, 主动确认后再运行)"
+"即将运行: {mode}\n"
+"\n"
+"此任务会频繁控制鼠标。\n"
+"停止方法: 按热键暂停 ok-nte, 再手动停止任务。\n"
+"\n"
+"当前热键: {hotkey}\n"
+"如不确定热键, 请点击取消, 确认后再运行。"
 msgstr ""
 
 msgid "赤龙古堡-残丝长巷篝火"
@@ -1083,11 +1087,6 @@ msgstr ""
 msgid "捞币"
 msgstr ""
 
-msgid ""
-"导入数据会完整覆盖当前用户资料.\n"
-"导出数据会导出完整用户资料."
-msgstr ""
-
 msgid "资料管理"
 msgstr ""
 
@@ -1226,9 +1225,6 @@ msgstr "<p>用于配置并保存常用的 4 人队伍阵容与出招表, 修改�
 msgid "OpenVINO 单次推理超时，已自动关闭目标检测；重启程序后会重新尝试启用。"
 msgstr ""
 
-msgid "管理"
-msgstr ""
-
 msgid "批量删除"
 msgstr ""
 
@@ -1270,9 +1266,6 @@ msgstr "外置代码应用失败"
 
 msgid "已应用外置代码: {}"
 msgstr "已应用外置代码: {}"
-
-msgid "手动添加或修改 Python 代码后, 需点击 [{refresh}] 以生效. 关于编写角色出招表的指南, 请参考 <a href='{doc_url}'>文档</a>."
-msgstr "手动添加或修改 Python 代码后, 需点击 [{refresh}] 以生效. 关于编写角色出招表的指南, 请参考 <a href='{doc_url}'>文档</a>."
 
 msgid "角色"
 msgstr "角色"
@@ -1455,4 +1448,28 @@ msgid "启用开战优先级"
 msgstr ""
 
 msgid "关闭时不按角色执行开战首切"
+msgstr ""
+
+msgid "鼠标占用警告"
+msgstr ""
+
+msgid "数据备份"
+msgstr "数据备份"
+
+msgid "用户数据"
+msgstr "用户数据"
+
+msgid "ZIP 格式备份; 导入将覆盖当前数据"
+msgstr "ZIP 格式备份; 导入将覆盖当前数据"
+
+msgid "手动修改 Python 代码后, 需点击 [{refresh}] 生效"
+msgstr "手动修改 Python 代码后, 需点击 [{refresh}] 生效"
+
+msgid "编写指南"
+msgstr "编写指南"
+
+msgid "噗卡乐园 - 命中幸运星"
+msgstr ""
+
+msgid "在可进行NPC交互的位置启动任务"
 msgstr ""

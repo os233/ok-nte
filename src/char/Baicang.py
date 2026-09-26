@@ -83,13 +83,11 @@ class Baicang(BaseChar):
         )
 
         def entry():
-            ultimate_result = yield ultimate
-            if ultimate_result:
+            if (yield ultimate):
                 self._perform_burst(context)
                 return
 
-            skill_result = yield skill
-            if skill_result:
+            if (yield skill):
                 self._post_skill_dodge()
             else:
                 yield fallback_dodge

@@ -832,12 +832,14 @@ class TeamManagerTab(CustomTab):
         if isinstance(error, WorkshopInstallError):
             directory = error.details.get("directory", "")
             if error.code == WorkshopInstallErrorCode.EXTERNAL_DIRECTORY_EXISTS:
-                return self.tr('外置代码目录“{}”已存在, 请修改目录名称后重试。').format(
-                    directory
-                )
+                return self.tr("外置代码目录“{}”已存在, 请修改目录名称后重试。").format(directory)
             if error.code == WorkshopInstallErrorCode.INVALID_EXTERNAL_DIRECTORY:
                 return self.tr("外置代码目录名称无效")
         return str(error) or error.__class__.__name__
+
+    def navigate_to_workshop(self) -> None:
+        self.command_stack_layout.setCurrentIndex(1)
+        self.on_open_workshop()
 
     def on_open_workshop(self) -> None:
         dialog = WorkshopDialog(self.workshop_repository, self.window())

@@ -43,11 +43,14 @@ class TestLauncherTask(unittest.TestCase):
 
     def test_find_process_window_uses_launcher_capture_window_class(self):
         task = self._make_task()
-        proc = {"pid": 1}
-        task._find_process = Mock(return_value=proc)
+        proc = {"pid": 1, "name": LAUNCHER_EXE[0]}
         task._find_window_for_process = Mock(return_value=123)
 
-        self.assertEqual((proc, 123), task._find_process_window(LAUNCHER_EXE))
+        with patch(
+            "src.tasks.LauncherTask.psutil.process_iter",
+            return_value=[Mock(info=proc)],
+        ):
+            self.assertEqual((proc, 123), task._find_process_window(LAUNCHER_EXE))
 
         task._find_window_for_process.assert_called_once_with(
             proc,

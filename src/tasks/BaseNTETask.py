@@ -17,6 +17,7 @@ from ok import (
 )
 
 from src import text_black_color
+from src.events import ConfirmationRequested, communicate
 from src.Labels import Labels
 from src.scene.NTEScene import NTEScene
 from src.scene.PositionMap import PositionMap
@@ -38,6 +39,14 @@ MSG_MAIN_DETECTION_FAILED = (
     "2. 尝试开启 Windows “自动管理应用的颜色”设置。"
 )
 MSG_WORLD_DETECTION_FAILED = "大世界检测失败: 请检查游戏内 UI 透明度是否已设置为 1.0。"
+MOUSE_CONTROL_WARNING_TITLE = "鼠标占用警告"
+MOUSE_CONTROL_WARNING = (
+    "即将运行: {mode}\n\n"
+    "此任务会频繁控制鼠标。\n"
+    "停止方法: 按热键暂停 ok-nte, 再手动停止任务。\n\n"
+    "当前热键: {hotkey}\n"
+    "如不确定热键, 请点击取消, 确认后再运行。"
+)
 
 
 class BaseNTETask(
@@ -71,6 +80,27 @@ class BaseNTETask(
         self.config_description.update(
             {self.CONF_CLAIM_REWARD_COUNT: "设置为0则领取当前体力可领取的全部奖励"}
         )
+
+    def confirm_mouse_control_warning(
+        self, *, mode: str | None = None, close_delay_seconds: int = 3
+    ) -> bool:
+        try:
+            hotkey = og.executor.basic_options.get("Start/Stop")
+        except Exception:
+            hotkey = "--"
+
+        if mode is None:
+            mode = self.tr(self.name)
+
+        confirmation = ConfirmationRequested(
+            self.tr(MOUSE_CONTROL_WARNING_TITLE),
+            self.tr(MOUSE_CONTROL_WARNING).format(mode=mode, hotkey=hotkey),
+            rich_text=False,
+            hide_cancel=False,
+            close_delay_seconds=close_delay_seconds,
+        )
+        communicate.confirmation_requested.emit(confirmation)
+        return confirmation.wait_for_response()
 
     @property
     def thread_pool_executor(self) -> ThreadPoolExecutor | None:
@@ -137,6 +167,22 @@ class BaseNTETask(
     @property
     def openvino_available(self):
         return getattr(og.my_app, "openvino_available", None)
+
+    def parse_ocr_number(self, ocr_result) -> int:
+        if not ocr_result:
+            return 0
+
+        result = "".join(item.name for item in ocr_result)
+        result = re.sub(r"[,.]", "", result)
+        match = re.search(r"(\d+)", result)
+        if not match:
+            return 0
+
+        try:
+            return int(match.group(1))
+        except ValueError:
+            self.log_warning(f"OCR number parse error: {result}")
+            return 0
 
     # fmt: off
     def click(self, x: int | Box | List[Box] = -1, y=-1, move_back=None, name=None,
@@ -909,7 +955,7 @@ class BaseNTETask(
             self.sleep(0.1)
         result = self.wait_until(
             lambda: not self.find_confirm(box=box),
-            pre_action=lambda: self.operate_click(button, interval=1),
+            pre_action=lambda: self.operate_click(button, interval=2),
             time_out=time_out,
             settle_time=settle_time,
             raise_if_not_found=raise_if_not_found,

@@ -575,6 +575,16 @@ class TestCustomChar(TaskTestCase):
         self.assertEqual(kwargs["data"]["q"], "Source text")
         self.assertEqual(kwargs["data"]["tl"], "en-US")
 
+    def test_char_manager_and_hub_navigate_to_workshop(self):
+        from src.ui.CharHubTab import CharHubTab
+
+        hub = CharHubTab(manager=self.manager)
+        with patch.object(hub.team_manager_tab, "on_open_workshop") as mock_open_workshop:
+            hub.char_manager_tab.workshop_btn.click()
+            self.assertEqual(hub.stacked_widget.currentWidget(), hub.team_manager_tab)
+            self.assertEqual(hub.team_manager_tab.command_stack_layout.currentIndex(), 1)
+            mock_open_workshop.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

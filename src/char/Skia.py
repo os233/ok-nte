@@ -30,8 +30,7 @@ class Skia(BaseChar):
         ultimate = self.click_ultimate_action()
 
         def entry():
-            skill_result = yield skill
-            if skill_result:
+            if (yield skill):
                 self.sleep(0.4)
             yield ultimate
 
