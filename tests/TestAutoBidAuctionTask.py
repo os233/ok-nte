@@ -8,6 +8,7 @@ from unittest.mock import Mock, PropertyMock, patch
 from ok import TaskDisabledException, WaitFailedException
 from ok.core.config_schema import build_config_fields
 
+import src.tasks.auction.recovery as auction_recovery
 import src.tasks.auction.welfare as auction_welfare
 import src.tasks.AutoBidAuctionTask as auction_module
 from src.scene.PositionMap import PositionMap
@@ -511,9 +512,7 @@ class TestAuctionWelfareQuota(unittest.TestCase):
         停在「未领完」, 高价值品质静默不卖。
         """
         task = _make_task()
-        task.ocr = Mock(
-            side_effect=[[], [self._text_box("今日已领取次数：2/5")]]
-        )
+        task.ocr = Mock(side_effect=[[], [self._text_box("今日已领取次数：2/5")]])
 
         task._read_welfare_counter(self._boxes())
 
@@ -552,9 +551,7 @@ class TestAuctionWelfareQuota(unittest.TestCase):
         """
         task = _make_task()
         # 领取前读到 4/5, 领取后两次换帧重读全部落空(如弹窗领取后立即关闭)。
-        task.ocr = Mock(
-            side_effect=[[self._text_box("今日已领取次数：4/5")], [], []]
-        )
+        task.ocr = Mock(side_effect=[[self._text_box("今日已领取次数：4/5")], [], []])
         task._wait_click_optional = Mock(return_value=True)
         task._close_welfare_dialog = Mock(return_value=True)
 
@@ -1299,9 +1296,7 @@ class TestAuctionQualitySelection(unittest.TestCase):
     def test_selection_clicks_every_quality_when_all_are_listed(self):
         task = self._task()
 
-        self.assertEqual(
-            task._select_quality_filters(None, AutoBidAuctionTask.QUALITY_KEYS), 6
-        )
+        self.assertEqual(task._select_quality_filters(None, AutoBidAuctionTask.QUALITY_KEYS), 6)
         self.assertEqual(task.operate_click.call_count, 6)
 
     def test_selection_uses_the_default_gap(self):
@@ -1394,9 +1389,7 @@ class TestAuctionQualityListCleaning(unittest.TestCase):
                 self.assertEqual(task._sell_qualities(), [])
 
     def test_unknown_names_are_dropped(self):
-        task = self._task(
-            AutoBidAuctionTask.CONF_SELL_BEFORE_WELFARE, ["品质不存在", "品质白"]
-        )
+        task = self._task(AutoBidAuctionTask.CONF_SELL_BEFORE_WELFARE, ["品质不存在", "品质白"])
 
         self.assertEqual(task._sell_qualities(), ["品质白"])
 
@@ -2518,9 +2511,7 @@ class TestAuctionEstimateStableRead(unittest.TestCase):
         """reads 为 (值, 是否贴边) 序列, 用完后一直重复最后一帧。"""
         task = _make_task()
         task.sleep = Mock(side_effect=self.clock.sleep)
-        task._read_estimate_value = Mock(
-            side_effect=list(reads) + [list(reads)[-1]] * 40
-        )
+        task._read_estimate_value = Mock(side_effect=list(reads) + [list(reads)[-1]] * 40)
         return task
 
     def test_tight_reads_do_not_accumulate_the_stability_counter(self):
@@ -2536,9 +2527,7 @@ class TestAuctionEstimateStableRead(unittest.TestCase):
         value = task._read_stable_asset_value(Mock(), 5, "当前估价")
 
         # 不得把它当成「读数稳定」返回; 允许走超时兜底, 但必须有贴边告警。
-        self.assertFalse(
-            any("读数稳定" in str(c.args[0]) for c in task.log_info.call_args_list)
-        )
+        self.assertFalse(any("读数稳定" in str(c.args[0]) for c in task.log_info.call_args_list))
         self.assertTrue(
             any("贴住识别区域边界" in str(c.args[0]) for c in task.log_warning.call_args_list)
         )
@@ -2550,10 +2539,7 @@ class TestAuctionEstimateStableRead(unittest.TestCase):
 
         self.assertIsNone(task._read_stable_asset_value(Mock(), 5, "当前估价"))
         self.assertTrue(
-            any(
-                "BOX_ESTIMATE 右边界" in str(c.args[0])
-                for c in task.log_warning.call_args_list
-            )
+            any("BOX_ESTIMATE 右边界" in str(c.args[0]) for c in task.log_warning.call_args_list)
         )
 
     def test_recovery_after_a_transient_tight_read(self):
@@ -2644,9 +2630,7 @@ class TestAuctionEstimateLabelAnchor(unittest.TestCase):
 
         self.assertIsNone(value)
         # 必须是因为「分组不自洽」被拒, 而不是因为标签没读到之类的原因。
-        self.assertTrue(
-            any("不自洽" in str(c.args[0]) for c in task.log_debug.call_args_list)
-        )
+        self.assertTrue(any("不自洽" in str(c.args[0]) for c in task.log_debug.call_args_list))
 
     def test_partial_text_right_of_the_label_is_rejected(self):
         """标签右边读到 `,643` 说明首位被裁, 按未读出处理。"""
@@ -2929,7 +2913,11 @@ class TestAuctionWorldDropRecovery(unittest.TestCase):
 
     def setUp(self):
         self.clock = _FakeTime()
+        # 回场流程已拆到 auction/recovery.py, 假时钟要同时控制任务侧与回场侧的 time。
         patcher = patch.object(auction_module, "time", self.clock)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = patch.object(auction_recovery, "time", self.clock)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -2977,9 +2965,7 @@ class TestAuctionWorldDropRecovery(unittest.TestCase):
         task = self._task(match=False, world=True)
         started = self.clock.now
 
-        self.assertEqual(
-            task._handle_match_click(Mock(), self.clock.now + 120), AuctionState.WORLD
-        )
+        self.assertEqual(task._handle_match_click(Mock(), self.clock.now + 120), AuctionState.WORLD)
         self.assertLess(self.clock.now - started, AutoBidAuctionTask.MATCH_CLICK_TIMEOUT)
 
     def test_stage_match_recovers_when_world_detected_before_timeout(self):
@@ -3034,9 +3020,7 @@ class TestAuctionWorldDropRecovery(unittest.TestCase):
         task._recover_quota = 1
         task._recover_from_world = Mock(return_value=AuctionState.BID)
 
-        self.assertEqual(
-            task._resume_after_world_drop(Mock(), self.clock.now), AuctionState.BID
-        )
+        self.assertEqual(task._resume_after_world_drop(Mock(), self.clock.now), AuctionState.BID)
         self.assertEqual(task._recover_quota, 0)
 
         with self.assertRaises(WaitFailedException):
@@ -3154,7 +3138,11 @@ class TestAuctionEntryRecover(unittest.TestCase):
 
     def setUp(self):
         self.clock = _FakeTime()
+        # 回场流程已拆到 auction/recovery.py, 假时钟要同时控制任务侧与回场侧的 time。
         patcher = patch.object(auction_module, "time", self.clock)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = patch.object(auction_recovery, "time", self.clock)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -3208,10 +3196,7 @@ class TestAuctionEntryRecover(unittest.TestCase):
         task._ensure_auction_entry(Mock())
 
         self.assertTrue(
-            any(
-                "启动回场未成功" in str(call.args[0])
-                for call in task.log_warning.call_args_list
-            )
+            any("启动回场未成功" in str(call.args[0]) for call in task.log_warning.call_args_list)
         )
 
     def test_does_not_consume_round_recover_quota(self):
@@ -3235,7 +3220,11 @@ class TestAuctionReturnBudget(unittest.TestCase):
 
     def setUp(self):
         self.clock = _FakeTime()
+        # 回场流程已拆到 auction/recovery.py, 假时钟要同时控制任务侧与回场侧的 time。
         patcher = patch.object(auction_module, "time", self.clock)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = patch.object(auction_recovery, "time", self.clock)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -3357,9 +3346,7 @@ class TestAuctionTimeoutConstants(unittest.TestCase):
             counts[value] = counts.get(value, 0) + 1
 
         unknown = {
-            value: count
-            for value, count in counts.items()
-            if value not in self.ALLOWED_BARE
+            value: count for value, count in counts.items() if value not in self.ALLOWED_BARE
         }
         self.assertEqual(
             unknown,
@@ -3593,9 +3580,7 @@ class TestAuctionAssistFeaturesConfig(unittest.TestCase):
         """默认勾选「低保金」, 表情包仍需用户主动开启。"""
         task = _make_configured_task()
 
-        self.assertEqual(
-            task.default_config[task.CONF_ASSIST_FEATURES], [task.ASSIST_WELFARE]
-        )
+        self.assertEqual(task.default_config[task.CONF_ASSIST_FEATURES], [task.ASSIST_WELFARE])
 
     def test_legacy_assist_switches_are_gone(self):
         """旧开关合并进多选框后不应再注册, 否则面板上会多出两个失效控件。"""
@@ -3761,8 +3746,19 @@ class TestAuctionRaiseModeConfig(unittest.TestCase):
 
     def test_key_sequence_never_changes_the_price_text(self):
         """任何价格都要能被按键序列原样拼回来, 否则会输错金额。"""
-        for price in ("1", "20", "100", "1000", "6600", "10000", "100000",
-                      "300000", "66666", "1000000", "166660"):
+        for price in (
+            "1",
+            "20",
+            "100",
+            "1000",
+            "6600",
+            "10000",
+            "100000",
+            "300000",
+            "66666",
+            "1000000",
+            "166660",
+        ):
             with self.subTest(price=price):
                 self.assertEqual(
                     "".join(AutoBidAuctionTask._price_key_sequence(price)),
@@ -4007,9 +4003,7 @@ class TestAuctionResultStageBudget(unittest.TestCase):
         task._stage_result(Mock(), round_deadline)
 
         task._observe_post_round_on_main_screen.assert_called_once()
-        self.assertEqual(
-            task._observe_post_round_on_main_screen.call_args[0][1], round_deadline
-        )
+        self.assertEqual(task._observe_post_round_on_main_screen.call_args[0][1], round_deadline)
 
     def test_slow_settlement_still_finishes_the_round(self):
         """结算空转 89.5 秒后走完整个收尾不能抛异常(修复前抛「单轮拍卖超时」)。"""
