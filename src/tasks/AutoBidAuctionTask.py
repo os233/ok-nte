@@ -2,15 +2,15 @@ import math
 import re
 import time
 from datetime import date, datetime, timedelta
-from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from decimal import Decimal
 
 from ok import Box, TaskDisabledException, WaitFailedException
 
 from src.tasks.auction import layout as auction_layout
 from src.tasks.auction import options as auction_options
+from src.tasks.auction import price as auction_price
 from src.tasks.auction.layout import (
     FULLWIDTH_NUMERIC,
-    PAD_SHORTCUTS,
     RE_BID,
     RE_BID_CONFIRM,
     RE_BID_PANEL,
@@ -1529,10 +1529,9 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         mode = self.config.get(self.CONF_BID_MODE, self.BID_MODE_CUSTOM)
 
         if mode == self.BID_MODE_LIST:
-            prices = self._resolve_bid_prices()
-            if not prices:
-                raise ValueError(f"每轮指定价格未配置: {self.CONF_BID_PRICES[0]} 必须大于 0")
-            self._validate_last_bid_is_higher(prices)
+            auction_price.validate_bid_prices(
+                [self._config_int(key, 0) for key in self.CONF_BID_PRICES]
+            )
             return
 
         if mode == self.BID_MODE_ESTIMATE:
@@ -1599,59 +1598,12 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
             "都没有勾选品质, 本次运行不会清掉任何藏品"
         )
 
-    # --- 资产解析 ---
-    @staticmethod
-    def _parse_asset_value(raw_text: str) -> int | None:
-        """统一解析资产 OCR 文本, 返回整数或 None。
-
-        处理流程:
-        1. 全角数字与全角逗号转半角.
-        2. 修正常见 OCR 错误 (O -> 0, l/I -> 1).
-        3. 提取数字.
-        4. 转换为 int, 失败时返回 None.
-        """
-        normalized = raw_text.translate(FULLWIDTH_NUMERIC)
-        corrected = normalized.replace("l", "1").replace("I", "1").replace("O", "0")
-        digits = re.sub(r"[^\d]", "", corrected)
-        if not digits:
-            return None
-
-        try:
-            return int(digits)
-        except ValueError:
-            return None
-
-    @staticmethod
-    def _is_partial_number_text(raw_text: str) -> bool:
-        """判断 OCR 文本是否为「首位数字被漏读」的残缺读数。
-
-        估价按千位分隔显示, 逗号前面必须有数字。首位数字在区域最左侧, OCR 对它的识别
-        不稳定, 漏读时会剩下 ",544" 这种逗号前空着的文本 (线上日志 18:56 那局连着 9 次),
-        它对应的真实值至少是 "x,544"。把它当结果会按低一个数量级的价格出价。
-        """
-        normalized = raw_text.translate(FULLWIDTH_NUMERIC)
-        digits_and_commas = re.sub(r"[^\d,]", "", normalized)
-        return digits_and_commas.startswith(",")
-
-    @staticmethod
-    def _has_inconsistent_grouping(raw_text: str) -> bool:
-        """判断带千位分隔符的读数是否「位数与逗号不自洽」。
-
-        千位分隔的合法形式只有 `1,234` / `12,345` / `123,456` 这几种: 去掉逗号后
-        长度必须满足 (len - 1) % 3 == 0 且首位分组不为空。`1,23` / `12,3,456` 这类
-        不合法, 说明 OCR 丢了或多了字符。
-
-        注意这条拦不住 `643`(无逗号, 天然自洽), 所以它只是辅助防线; 末位丢失主要靠
-        `_read_estimate_value` 的「数字右端贴裁框边界」告警来发现。
-        """
-        normalized = raw_text.translate(FULLWIDTH_NUMERIC)
-        digits_and_commas = re.sub(r"[^\d,]", "", normalized)
-        if "," not in digits_and_commas:
-            return False
-        groups = digits_and_commas.split(",")
-        if groups[0] == "" or len(groups[0]) > 3:
-            return False  # 首位分组缺失或超长, 由 _is_partial_number_text 或调用方处理
-        return any(len(group) != 3 for group in groups[1:])
+    # --- 资产解析 (兼容别名) ---
+    # 纯函数唯一来源: src/tasks/auction/price.py; OCR 副作用与告警仍在任务侧协调,
+    # 测试继续按 AutoBidAuctionTask.<名字> 访问。
+    _parse_asset_value = staticmethod(auction_price.parse_asset_value)
+    _is_partial_number_text = staticmethod(auction_price.is_partial_number_text)
+    _has_inconsistent_grouping = staticmethod(auction_price.has_inconsistent_grouping)
 
     def _read_estimate_texts(self, box: Box, timeout: float) -> list:
         """读区域内**全部**文本, 不做 match 过滤。
@@ -1791,47 +1743,14 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
 
         return self._raise_price(base_price, bid_count)
 
-    def _validate_last_bid_is_higher(self, prices: list[int]) -> None:
-        """校验最后一次出价高于前一次。
-
-        游戏中第 6 次出价必须高于第 5 次, 否则这一次出价会被系统拒绝;
-        留 0 沿用上一次价格会导致两者相等, 所以第 6 次必须显式填写。
-        """
-        if len(prices) < 2:
-            return
-
-        last_key = self.CONF_BID_PRICES[len(prices) - 1]
-        previous_key = self.CONF_BID_PRICES[len(prices) - 2]
-        last, previous = prices[-1], prices[-2]
-        if last > previous:
-            return
-
-        # 区分「没填」和「填小了」, 两种情况用户要做的修改不一样。
-        if self._config_int(last_key, 0) <= 0:
-            raise ValueError(
-                f"{last_key} 未设置: 沿用上一次的价格 {previous} 不会高于 "
-                f"{previous_key}, 请显式填写一个更大的值"
-            )
-        raise ValueError(f"{last_key} ({last}) 必须大于 {previous_key} ({previous})")
-
     def _resolve_bid_prices(self) -> list[int]:
-        """把 6 个每轮指定价格解析成可按出价序号直接取用的列表。
+        """读取 6 个每轮指定价格并解析成可按出价序号直接取用的列表。
 
-        每个价格对应一次出价: 第 1 次用「第1次出价价格」, 第 2 次用「第2次出价价格」, 依此类推。
-        未设置(0)的回合沿用上一次已设置的价格, 因此只填前几次也能正常工作。
-        第 1 次出价必须有价格, 否则返回空列表, 由调用方按配置错误处理。
+        解析规则见 auction_price.resolve_bid_prices: 未设置(0)的回合沿用上一次
+        已设置的价格, 第 1 次出价必须有价格, 否则返回空列表由调用方按配置错误处理。
         """
-        resolved: list[int] = []
-        current = 0
-        for key in self.CONF_BID_PRICES:
-            price = self._config_int(key, 0)
-            if price > 0:
-                current = price
-            resolved.append(current)
-
-        if not resolved or resolved[0] <= 0:
-            return []
-        return resolved
+        raw_prices = [self._config_int(key, 0) for key in self.CONF_BID_PRICES]
+        return auction_price.resolve_bid_prices(raw_prices)
 
     def _listed_bid_price(self, bid_count: int) -> int:
         """按出价序号取每轮指定价格, 出价次数超出配置项时沿用最后一次的价格。"""
@@ -2016,8 +1935,7 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
             return base_price
 
         ratio = self._config_float(self.CONF_ESTIMATE_RATIO, 1.0)
-        result = Decimal(str(estimate)) * Decimal(str(ratio))
-        final_price = int(result.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+        final_price = auction_price.estimate_price(estimate, ratio)
         if final_price <= 0:
             self.log_warning(
                 f"按估价 {estimate} 与倍率 {ratio} 计算出的价格 {final_price} 无效, "
@@ -2035,10 +1953,10 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
 
         special_rounds = self._config_int_list(self.CONF_SPECIAL_ROUNDS)
         special_price = self._config_int(self.CONF_SPECIAL_ROUND_PRICE, 0)
-        if special_price > 0 and bid_count in special_rounds:
-            self.log_info(f"指定回合 {bid_count} 使用单独价格 {special_price}")
-            return special_price
-        return None
+        price = auction_price.special_round_price(bid_count, special_rounds, special_price)
+        if price is not None:
+            self.log_info(f"指定回合 {bid_count} 使用单独价格 {price}")
+        return price
 
     def _raise_mode(self) -> str:
         """读取加价方式, 无效值按默认「倍率」处理。
@@ -2052,61 +1970,25 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
     def _raise_price(self, base_price: int, bid_count: int) -> int:
         """按配置的加价方式计算第 bid_count 次出价的价格。
 
-        全程用 Decimal 计算: 倍率模式是 `base * value ** offset`, 用原始 float 时
-        「加价数值」填得稍大就会在 `value ** offset` 上抛 OverflowError(实测
-        `100000 * 10.0 ** 400`)。异常会被 _stage_bid_loop 吞成「出价异常」重试,
-        价格永远算不出来, 却看不到真正的原因。
+        加价回合与三种方式的计算规则、Decimal 溢出防护见 auction_price;
+        这里负责读取配置、告警与回退基础价。
         """
         mode = self._raise_mode()
         value = self._config_decimal(self.CONF_RAISE_VALUE, "0")
         raise_round = self._config_int(self.CONF_RAISE_ROUND, 0)
 
-        # 在达到配置的加价回合前使用基础价.
-        if raise_round > 0 and bid_count < raise_round:
+        # 未到配置的加价回合, 直接使用基础价.
+        offset = auction_price.raise_offset(bid_count, raise_round)
+        if offset is None:
             return base_price
 
-        # 计算加价偏移次数, 从 1 开始.
-        offset = bid_count if raise_round == 0 else bid_count - raise_round + 1
-
-        # 根据所选方式计算价格.
-        try:
-            base = Decimal(str(base_price))
-            if mode == self.RAISE_MODE_MULTIPLE:
-                # 指数增长: 基础价 * (倍率 ^ offset).
-                result = base * (value**offset)
-            elif mode == self.RAISE_MODE_PERCENT:
-                # 线性增长: 基础价 * (1 + 百分比 / 100 * offset).
-                result = base * (Decimal(1) + value / 100 * offset)
-            else:  # 自定义
-                # 线性增长: 基础价 + 自定义值 * offset.
-                result = base + value * offset
-            # 量化必须留在 try 内: Decimal 的指数范围极大, `10 ** 400` 仍是有限值,
-            # is_finite() 拦不住; 但它有 405 位有效数字, 超过默认上下文精度 28,
-            # 到这一步 quantize 才抛 InvalidOperation。放在 try 外等于把
-            # OverflowError 换成同样会漏出的 InvalidOperation。
-            # 位数粗筛(整数部分 30 位以上)提前挡掉, 避免真的把大数交给 quantize。
-            rounded = (
-                result.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
-                if result.adjusted() < 30
-                else None
-            )
-            if rounded is None:
-                result = None
-            else:
-                result = rounded
-        except (ArithmeticError, InvalidOperation, ValueError):
-            result = None
-
-        # 溢出/精度异常时 result 为 None, 或退化成非有限值(NaN / Infinity).
-        if result is None or not result.is_finite():
+        final_price = auction_price.raise_price(base_price, offset, mode=mode, raise_value=value)
+        if final_price is None:
             self.log_warning(
                 f"加价计算结果超出可表示范围, 回退到基础价 {base_price} "
                 f"(模式 {mode}, 数值 {value}, 加价偏移 {offset})"
             )
             return base_price
-
-        # 已在 try 内完成量化, 这里直接取整.
-        final_price = int(result)
 
         # 确保计算结果为正整数.
         if final_price <= 0:
@@ -2164,27 +2046,8 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
                 self._remaining_timeout(deadline, 0.1)
             self.operate_click(self.box_of_screen(*self.PAD_MAP[key]), after_sleep=0.2)
 
-    @staticmethod
-    def _price_key_sequence(price_str: str) -> list[str]:
-        """把价格字符串切分为按键序列, 可一次输入的 0000 / 00 优先整体输入。
-
-        按**最长优先**做前缀匹配, 而不是只在「剩余整串恰好等于快捷键」时才用:
-        后者会把 `1000000` 切成 `1 0 0 0000`(4 键), 前缀匹配切成 `1 0000 00`(3 键),
-        而每次点击都带 after_sleep —— 少按一键就少一次 0.2 秒的等待。
-        """
-        shortcuts = sorted(PAD_SHORTCUTS, key=len, reverse=True)
-        keys: list[str] = []
-        index = 0
-        while index < len(price_str):
-            for shortcut in shortcuts:
-                if price_str.startswith(shortcut, index):
-                    keys.append(shortcut)
-                    index += len(shortcut)
-                    break
-            else:
-                keys.append(price_str[index])
-                index += 1
-        return keys
+    # 按键序列纯函数唯一来源: src/tasks/auction/price.py。
+    _price_key_sequence = staticmethod(auction_price.price_key_sequence)
 
     def _verify_input_price(self, boxes: AuctionBoxes, price: int, deadline: float | None) -> None:
         """校验数字面板显示的价格与目标价格一致, 不一致时抛出异常。
