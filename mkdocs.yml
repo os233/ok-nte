@@ -63,6 +63,9 @@ nav:
           - 从源码运行: zh-CN/development/running-from-source.md
           - SceneFlow 作者指南: zh-CN/development/scene_flow.md
           - Combat Planner 开发指南: zh-CN/development/combat-planner.md
+          - 拍卖任务重构分析: zh-CN/development/auto-bid-auction-refactor.md
+          - 拍卖任务重构实施计划: zh-CN/development/auto-bid-auction-implementation-plan.md
+          - 拍卖任务分层设计提案(过程记录): zh-CN/development/auction-layering.md
 
 markdown_extensions:
   - admonition

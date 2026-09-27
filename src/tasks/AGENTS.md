@@ -8,7 +8,7 @@
 - 当前任务入口是 `AutoBidAuctionTask`, 继承 `NTEOneTimeTask` 与 `BaseNTETask`; 任务注册位于 `src/config.py`。保持现有任务标识、配置键、默认值及旧用户配置兼容。
 - 轮次状态机和整体流程编排归任务入口负责。拍卖专属的界面框、OCR 规则、解析、低保、仓库出售等能力归拍卖域; 不扩散到通用 mixin。
 - 不在拍卖任务中实现通用窗口控制、截图/OCR框架、角色战斗、场景全局状态或其他任务业务。发现可复用需求时先确认其确属跨任务能力, 再放入既有公共层。
-- 不把 `docs/zh-CN/development/auction-layering.md` 所述目标包结构当作现状。该文档是未实施提案; 代码迁移须按小阶段完成并保持各阶段可运行。
+- 拍卖分层已按 `docs/zh-CN/development/auto-bid-auction-implementation-plan.md` 实施为 `src/tasks/auction/` 包; `docs/zh-CN/development/auction-layering.md` 是过程提案记录, 其目标包结构与现状不逐字对应 (未单列 screens.py), 以实际代码为准。
 
 ## 代码与命名规范
 

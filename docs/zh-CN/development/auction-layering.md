@@ -1,6 +1,9 @@
 # 拍卖任务分层设计（提案）
 
-> 状态: **提案, 未实施**。实施完成后把本文并进 `mkdocs.yml` 的 nav。
+> 状态: **提案, 已由后续实施取代**。2026-09 分层已按
+> `auto-bid-auction-implementation-plan.md` 落地为 `src/tasks/auction/` 包
+> (options/layout/price/sell/welfare/recovery, 未单列 screens.py); 本文保留为
+> 论证与修正过程的记录, 其目标包结构不与现状逐字对应, 以实际代码为准。
 > 依据的代码状态: 分支 `fix/auction-2` @ `0e8e93d` + 工作区未提交改动
 > (`AutoBidAuctionTask.py` 3238 行 / `TestAutoBidAuctionTask.py` 282 条用例全绿)。
 
