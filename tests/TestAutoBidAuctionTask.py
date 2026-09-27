@@ -520,15 +520,47 @@ class TestAuctionWelfareQuota(unittest.TestCase):
         self.assertEqual(task.ocr.call_count, AutoBidAuctionTask.WELFARE_COUNTER_READS)
         task.next_frame.assert_called_once()
 
-    def test_claim_click_increments_today_count(self):
+    def test_successful_claim_rereads_the_counter_after_the_click(self):
+        """点击领取后要重读弹窗次数, 而不是盲目本地 +1。
+
+        点击已发出不等于领取已生效: 盲目 +1 会在点击落空时虚增当日次数, 提前按
+        「已领完」放开出售抬高资产, 弹窗从此不再打开, 虚计再无读数可纠偏。弹窗还
+        开着时重读权威读数, 读数整体覆盖本地值。
+        """
         task = _make_task()
-        task._read_welfare_counter = Mock()
+        task.ocr = Mock(
+            side_effect=[
+                [self._text_box("今日已领取次数：4/5")],
+                [self._text_box("今日已领取次数：5/5")],
+            ]
+        )
         task._wait_click_optional = Mock(return_value=True)
         task._close_welfare_dialog = Mock(return_value=True)
 
         task._try_claim_welfare(self._boxes(), None)
 
-        self.assertEqual(task._welfare_claims_today, 1)
+        self.assertEqual(task._welfare_claims_today, 5)
+        self.assertEqual(task._welfare_daily_limit, 5)
+        self.assertTrue(task._welfare_quota_exhausted())
+
+    def test_failed_claim_click_keeps_the_pre_claim_count(self):
+        """点击落空时本地计数保持领取前的值, 往保守方向兜。
+
+        多记的代价是卖掉高价值品质把资产抬过 10 万、当天剩余低保领不到; 少记的代价
+        只是少卖几件藏品。两个方向不对称, 读不到领取后的新读数就不能 +1。
+        """
+        task = _make_task()
+        # 领取前读到 4/5, 领取后两次换帧重读全部落空(如弹窗领取后立即关闭)。
+        task.ocr = Mock(
+            side_effect=[[self._text_box("今日已领取次数：4/5")], [], []]
+        )
+        task._wait_click_optional = Mock(return_value=True)
+        task._close_welfare_dialog = Mock(return_value=True)
+
+        task._try_claim_welfare(self._boxes(), None)
+
+        self.assertEqual(task._welfare_claims_today, 4)
+        self.assertFalse(task._welfare_quota_exhausted())
 
     def test_missing_claim_button_does_not_increment(self):
         task = _make_task()
@@ -1112,6 +1144,62 @@ class TestAuctionBidMode(unittest.TestCase):
 
         task._validate_price_config()
 
+    def test_validate_rejects_non_positive_raise_value_when_auto_raise_on(self):
+        """加价数值为 0 或负数时必须在入口拦下。
+
+        它们能通过 is_finite 校验, 运行时每口出价都触发回退告警(倍率模式偶数次偏移
+        还会先算出天文数字再回退); 加价的语义就是往上加, 非法配置不该等到出价阶段
+        才以每轮告警的方式暴露。
+        """
+        for raise_mode in AutoBidAuctionTask.RAISE_MODES:
+            for raw in ("0", "-1"):
+                with self.subTest(mode=raise_mode, value=raw):
+                    task = self._task(
+                        **{
+                            AutoBidAuctionTask.CONF_FIXED_PRICE: 1000,
+                            AutoBidAuctionTask.CONF_AUTO_RAISE: True,
+                            AutoBidAuctionTask.CONF_RAISE_MODE: raise_mode,
+                            AutoBidAuctionTask.CONF_RAISE_VALUE: raw,
+                        }
+                    )
+                    with self.assertRaises(ValueError):
+                        task._validate_price_config()
+
+    def test_estimate_mode_warns_when_fallback_base_price_is_invalid(self):
+        """估价模式下「基础价」只作回退价, 非正整数不拦启动但必须提前告警。
+
+        回退价非法时, 估价一旦读不出, 那次出价会以「非法价格」连续失败 3 次丢掉
+        整轮 —— 用户只在日志里看到出价失败, 看不出是配置问题。正常配置下(估价
+        可读)基础价根本用不到, 拦启动会误伤能正常跑的配置, 所以只告警。
+        """
+        for raw in (0, "abc", None):
+            with self.subTest(value=raw):
+                task = self._task(
+                    **{
+                        AutoBidAuctionTask.CONF_BID_MODE: AutoBidAuctionTask.BID_MODE_ESTIMATE,
+                        AutoBidAuctionTask.CONF_ESTIMATE_RATIO: "1",
+                        AutoBidAuctionTask.CONF_FIXED_PRICE: raw,
+                    }
+                )
+
+                task._validate_price_config()
+
+                self.assertTrue(task.log_warning.called)
+
+    def test_estimate_mode_is_quiet_with_a_valid_fallback_base_price(self):
+        """默认基础价(1)是合法回退价, 不能误报告警。"""
+        task = self._task(
+            **{
+                AutoBidAuctionTask.CONF_BID_MODE: AutoBidAuctionTask.BID_MODE_ESTIMATE,
+                AutoBidAuctionTask.CONF_ESTIMATE_RATIO: "1",
+                AutoBidAuctionTask.CONF_FIXED_PRICE: 1,
+            }
+        )
+
+        task._validate_price_config()
+
+        self.assertFalse(task.log_warning.called)
+
 
 class TestAuctionCursorRestore(unittest.TestCase):
     """后台执行时点击必须还原鼠标位置, 否则鼠标会留在游戏窗口内。"""
@@ -1628,10 +1716,16 @@ class TestAuctionSellUnconfirmed(unittest.TestCase):
         task._ensure_sell_value = Mock(return_value=None)
         return task
 
-    def test_unconfirmed_sell_does_not_claim_success(self):
+    def test_unconfirmed_sell_returns_none_not_failure(self):
+        """读不出时必须返回 None(结果未知)而不是 False(确认失败)。
+
+        False 会让上层把这次计入满仓失败并置 _inventory_stuck; 而确认出售在此之前
+        已经点击, 出售可能已生效 —— 仓库实际清空后, 这个误置会让任务永远跳过拍卖
+        去重试一个空仓库的清理。None 才能把「未知」交给上层与超时同等处理。
+        """
         task = self._task()
 
-        self.assertFalse(task._sell_collections(Mock(), None))
+        self.assertIsNone(task._sell_collections(Mock(), None))
         self.assertNotIn("藏品出售完成", str(task.log_info.call_args_list))
 
     def test_unconfirmed_sell_says_it_could_not_be_confirmed(self):
@@ -1861,14 +1955,82 @@ class TestAuctionSellFailureEscalation(unittest.TestCase):
         escalated = task._sell_collections.call_args.args[2]
         self.assertIn("品质红", escalated)
 
-    def test_persistent_failure_marks_the_inventory_as_stuck(self):
-        task = self._task([False, False])
+    def test_escalated_confirmed_zero_restores_the_auction(self):
+        """放宽集合确认读数为 0 = 仓库无可卖藏品, 满仓前提失效, 必须复位恢复拍卖。
+
+        活锁回归: 上一轮出售结果未确认(实际已清空仓库)会让 _inventory_stuck 置位,
+        之后每轮跳过拍卖重试清理, 而空仓库的出售价值永远读到 0, 满仓标记永远清不掉
+        —— 任务从此不再拍卖, 每轮记一次「满仓未清理」失败。唯一的出路是把
+        「全品质勾选 + 要求出售 + 确认读到 0」当作满仓结论已被推翻的证据。
+        """
+        task = self._task([False])
+        task._sell_failures = AutoBidAuctionTask.SELL_FAILURE_ESCALATE_AFTER
+        task._inventory_stuck = True
+
+        self.assertFalse(
+            task._sell_collections_with_escalation(Mock(), None, (), inventory_full=True)
+        )
+        # 直接以放宽集合开局, 确认 0 后复位: 下一轮不再跳过拍卖。
+        self.assertEqual(task._sell_collections.call_count, 1)
+        self.assertFalse(task._inventory_stuck)
+        # 没有东西可卖不是清理失败, 不推进放宽计数。
+        self.assertEqual(task._sell_failures, AutoBidAuctionTask.SELL_FAILURE_ESCALATE_AFTER)
+
+    def test_unconfirmed_outcome_does_not_feed_the_counter_but_keeps_cleanup(self):
+        """结果未知(None)与超时同等对待: 不计数, 但满仓时仍置位让下一轮重试清理。
+
+        确认出售在返回前就可能已经点击, 结果未知; 无证据的失败不该驱动放宽(会把
+        要保留的品质一起卖掉)。可仓库若真的还满, 不置位的话下一轮会去空烧匹配阶段。
+        """
+        task = self._task([None])
+
+        self.assertFalse(
+            task._sell_collections_with_escalation(Mock(), None, (), inventory_full=True)
+        )
+        self.assertEqual(task._sell_failures, 0)
+        self.assertTrue(task._inventory_stuck)
+
+    def test_unconfirmed_outcome_does_not_stick_when_not_full(self):
+        task = self._task([None])
+
+        self.assertFalse(
+            task._sell_collections_with_escalation(Mock(), None, (), inventory_full=False)
+        )
+        self.assertEqual(task._sell_failures, 0)
+        self.assertFalse(task._inventory_stuck)
+
+    def test_escalated_retry_unconfirmed_keeps_stuck_for_another_cleanup(self):
+        """放宽后的结果同样未知: 首次失败证据已计数, 置位等下一轮的确认读数。"""
+        task = self._task([False, None])
         task._sell_failures = AutoBidAuctionTask.SELL_FAILURE_ESCALATE_AFTER - 1
 
         self.assertFalse(
             task._sell_collections_with_escalation(Mock(), None, (), inventory_full=True)
         )
+        self.assertEqual(task._sell_failures, AutoBidAuctionTask.SELL_FAILURE_ESCALATE_AFTER)
         self.assertTrue(task._inventory_stuck)
+
+    def test_unconfirmed_sale_then_empty_warehouse_finally_restores_the_auction(self):
+        """端到端活锁回归: 未确认出售 → 空仓库反复确认 0 → 满仓标记必须复位。
+
+        修复前的序列是: 未确认出售被计为失败并置位 → 空仓库每轮确认 0 → 计数涨到
+        阈值后放宽开局 → 放宽确认 0 仍置位 → 永远跳过拍卖。修复后第三步起读到的
+        确认 0 会把满仓前提推翻, 任务恢复正常拍卖。
+        """
+        task = self._task([None, False, False, False])
+
+        # 第 1 轮: 出售结果未确认(实际已清空仓库) -> 跳过下一轮拍卖去清理。
+        task._sell_collections_with_escalation(Mock(), None, (), inventory_full=True)
+        self.assertTrue(task._inventory_stuck)
+
+        # 第 2 轮: 空仓库, 未放宽清单确认读到 0 -> 仍按满仓失败计数。
+        task._sell_collections_with_escalation(Mock(), None, (), inventory_full=True)
+        self.assertTrue(task._inventory_stuck)
+
+        # 第 3 轮: 先按未放宽清单确认 0(计满阈值), 同一轮内放宽重试再确认 0
+        # -> 满仓前提失效, 恢复拍卖。
+        task._sell_collections_with_escalation(Mock(), None, (), inventory_full=True)
+        self.assertFalse(task._inventory_stuck)
 
     def test_not_full_does_not_mark_the_inventory_as_stuck(self):
         """没满仓时出售失败不该让下一轮跳过拍卖。"""

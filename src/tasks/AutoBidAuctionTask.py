@@ -684,7 +684,9 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
                 "资产, 所以这一档只勾低价值品质",
                 self.CONF_SELL_AFTER_WELFARE: "勾选即出售: 今日低保次数领满后卖这些品质;"
                 "领满之后当天再也领不到低保, 可以放开勾选更高价值的品质; 一般应包含"
-                "「未领完低保时出售品质」勾选的全部品质, 否则领满后反而卖得更少",
+                "「未领完低保时出售品质」勾选的全部品质, 否则领满后反而卖得更少;"
+                "切换依据是低保金弹窗上的次数读数, 需勾选「低保金」辅助功能且资产低于"
+                "10 万弹窗才会被打开, 读不到读数时一律按未领完处理(保守, 少卖不亏)",
                 # --- 出价 ---
                 self.CONF_AUTO_RAISE: "在基础价之上按「加价方式」逐次提高出价",
                 self.CONF_FIXED_PRICE: "自定义价格的基准价; 必须为正整数, 否则任务不会启动",
@@ -727,8 +729,10 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         # 藏品出售连续失败计数: 满仓卖不掉时后续出价必然失败, 需要升级处理而不是每轮重试.
         self._sell_failures = 0
         self._inventory_stuck = False
-        # 当日低保领取记录. 次数与上限都从弹窗「今日已领取次数：N/5」读回来, 本地
-        # 累计只在弹窗不再打开(资产高于阈值)时补位, 下次读数会整体覆盖。
+        # 当日低保领取记录. 次数与上限只从弹窗「今日已领取次数：N/5」读回(领取前读
+        # 一次, 领取后再重读一次), 不做本地推算: 点击领取不等于领取生效, 盲目 +1 会
+        # 在点击落空时虚增次数, 提前切换出售清单抬高资产后弹窗不再打开, 计数再无
+        # 读数可纠偏。
         self._welfare_day: date | None = None
         self._welfare_claims_today = 0
         self._welfare_daily_limit: int | None = None
@@ -1098,6 +1102,8 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
             # 与其把整轮 deadline 空转掉, 不如先重试一次清理藏品.
             # 满仓是上一轮已经判定过的结论, 这里直接沿用, 不再要求重新 OCR 命中:
             # 满仓提示会被弹窗遮住, 重新检测失败就什么都不做, 变成每轮空跳的死循环.
+            # 前提若已过时(上一轮未确认的出售其实清空了仓库), 由清理流程自己用
+            # 「放宽清单确认读数为 0」的证据裁决并复位, 见 _sell_collections_with_escalation.
             self.log_warning("满仓且上次出售未成功, 跳过本轮拍卖, 先重试清理藏品")
             self.add_failed("满仓未清理")
             self._try_sell_collections(PostRoundState(inventory_full=True), boxes)
@@ -1936,8 +1942,9 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
 
         ⚠️ 判定依据是「今日低保**领满**」而不是「今天领到过」: 旧实现每次领取成功就
         追加出售, 于是「领 1 次 → 卖一次 → 资产过线 → 之后再也领不到」自我阻断, 用户
-        要花更多场次把资产花下去才能领下一次。读不到弹窗读数(资产高于阈值, 弹窗不再
-        打开)时按「还没领满」处理: 少卖一次只是少赚, 卖错了却会让当天剩下的低保领不到。
+        要花更多场次把资产花下去才能领下一次。读不到弹窗读数时按「还没领满」处理
+        (资产高于阈值弹窗不再打开, 或未勾选「低保金」辅助 —— 弹窗只在领取流程里打开):
+        少卖一次只是少赚, 卖错了却会让当天剩下的低保领不到。
 
         ⚠️ 满仓**不**切换清单: 满仓只说明必须腾空间, 不代表低保已无望, 按低保阶段保守
         地卖才符合「领低保优先」; 真腾不出空间时有既有的放宽机制兜底(连续满仓失败后
@@ -1971,6 +1978,19 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
                 raise ValueError(
                     f"估价倍率必须为正数, 当前: {self.config.get(self.CONF_ESTIMATE_RATIO)!r}"
                 )
+            # 估价读不出时回退「基础价」出价, 非正整数会让那次出价因「非法价格」
+            # 连续失败 3 次丢掉整轮。正常配置下不拦任务(估价可读时它根本用不到),
+            # 只提前把后果说清楚。
+            try:
+                fallback = int(self.config.get(self.CONF_FIXED_PRICE))
+            except (TypeError, ValueError):
+                fallback = 0
+            if fallback <= 0:
+                self.log_warning(
+                    f"「{self.CONF_FIXED_PRICE}」不是正整数"
+                    f"({self.config.get(self.CONF_FIXED_PRICE)!r}), "
+                    "估价读不出时回退的出价将无法输入, 该次出价会失败"
+                )
             return
 
         base_raw = self.config.get(self.CONF_FIXED_PRICE)
@@ -1993,6 +2013,12 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
                 ) from None
             if not raise_value.is_finite():
                 raise ValueError(f"加价数值配置非法: {self.config.get(self.CONF_RAISE_VALUE)!r}")
+            # 0 或负数会通过 is_finite, 运行时每口出价都触发回退告警(倍率模式偶数次
+            # 偏移还会先爆出天文数字); 加价的语义就是往上加, 在入口一并拦下。
+            if raise_value <= 0:
+                raise ValueError(
+                    f"加价数值必须为正数, 当前: {self.config.get(self.CONF_RAISE_VALUE)!r}"
+                )
 
     def _warn_if_no_sellable_quality(self) -> None:
         """两个出售品质清单都为空时给出告警: 开了出售模式却没有可出售的品质。
@@ -2685,9 +2711,12 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
             if self._wait_click_optional(boxes.claim, RE_CLAIM, deadline, 5, "领取按钮"):
                 self._bounded_sleep(deadline, 0.5)
                 self.log_info("已点击领取按钮")
-                # 本地 +1 只是为了在弹窗不再打开(资产高于阈值)时也能知道次数;
-                # 下次读数会整体覆盖, 所以这里多记一次是可自愈的。
-                self._welfare_claims_today += 1
+                # 点击已发出不代表领取已生效: 盲目 +1 会在点击落空时虚增当日次数,
+                # 提前按「已领完」放开出售, 抬高资产后弹窗不再打开, 当天剩下的低保
+                # 就领不到 —— 而且这次读数之后再无弹窗, 计数无法自愈。弹窗还开着,
+                # 直接重读权威读数; 读不到(弹窗领取后自动关闭等)就保持领取前的值:
+                # 少记一次只是少卖几件藏品, 多记一次却会让剩下的低保领不到。
+                self._read_welfare_counter(boxes, deadline)
             else:
                 self.log_info("未检测到领取按钮(今日次数可能已用尽), 直接关闭低保金弹窗")
 
@@ -2744,7 +2773,8 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
     def _read_welfare_counter(self, boxes: AuctionBoxes, deadline: float | None = None) -> None:
         """读弹窗正文的「今日已领取次数：N/5」, 刷新当日已领次数与上限。
 
-        弹窗只在领取流程里打开, 所以这次读数不额外花时间。
+        领取流程里会读两次: 打开弹窗后读一次(此时的值用于本轮出售清单决策), 点击
+        领取后再读一次(刷新为领取后的权威读数, 同时纠正点击落空造成的虚计)。
 
         读数**整体覆盖**本地累计值(而不是取较大者): 弹窗是权威来源, 覆盖能让
         「本地多记了一次」在下次读数时自愈。读不出时保持原值 —— 「今日已领完」
@@ -2908,13 +2938,21 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         sell_qualities: list[str] | tuple[str, ...] = (),
         *,
         require_sale: bool = False,
-    ) -> bool:
+    ) -> bool | None:
         """尝试出售藏品, deadline 为空时保持定期清理分支的原有行为。
 
         sell_qualities 是本次要卖掉的品质清单(由调用方按低保阶段算好), 勾选即出售。
 
         require_sale 表示本次出售必须真的清掉藏品(满仓时无法继续出价)。此时「一个品质
         都没勾上」不能再算成功 —— 那会把满仓标记清掉, 之后每轮出价都失败却不再重试清理。
+
+        Returns:
+            True: 出售确认生效(读到正数), 或没有勾选品质且本次不要求出售。
+            False: 确认失败: 已勾选品质但出售价值确认为 0(含重勾后仍为 0),
+                或要求出售却一个品质都没勾上 —— 这类读数是「没清掉藏品」的直接证据。
+            None: 本次尝试没有产生可信证据: 出售价值读不出(确认出售已点击, 结果未知),
+                或流程根本没走通(仓库入口/标题未就绪, 流程异常)。出售是否生效未知,
+                调用方必须与超时同等对待, 不能当成明确失败。
         """
         self.log_info("开始执行藏品出售流程")
         try:
@@ -2928,7 +2966,7 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
             )
             if not warehouse_button:
                 self.log_warning("藏品仓库入口未出现, 取消出售流程")
-                return False
+                return None
             self._bounded_sleep(deadline, 1)
             self.log_info("藏品仓库入口已点击")
 
@@ -2940,7 +2978,7 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
                 settle_time=0.5,
             ):
                 self.log_warning("藏品仓库界面加载失败, 取消出售流程")
-                return False
+                return None
             self.log_info("藏品仓库界面加载完成")
 
             # 上一次出售中途失败会把仓库留在出售模式, 此时「出售」圆钮的位置是「取消」,
@@ -2971,7 +3009,7 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
 
             if selection_ok is None:
                 self.log_warning("出售价值未读出, 本次出售是否清掉藏品无法确认")
-                return False
+                return None
             if not selection_ok:
                 if selected <= 0:
                     self.log_warning("没有勾选任何品质, 本次出售没有清掉任何藏品")
@@ -2995,7 +3033,8 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         except Exception as e:
             self.log_warning(f"藏品出售失败: {type(e).__name__}: {e}")
             self._close_warehouse(boxes)
-            return False
+            # 异常点可能在「确认出售」之后, 出售是否已生效未知, 与超时同理返回 None.
+            return None
 
     def _close_warehouse(self, boxes: AuctionBoxes) -> None:
         """关掉藏品仓库界面, 让出售模式和里面的勾选状态一起复位。
@@ -3069,12 +3108,20 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         第一次失败就立刻放宽, 把用户明确保留的品质一起卖掉(实测: 非满仓失败 5 次后,
         紧接一次满仓失败即触发, escalated 集合是 6 个品质全卖)。
 
-        出售超时(预算耗尽, _sell_collections 抛 WaitFailedException)**不**计入失败:
-        超时点无法区分是在「确认出售」之前还是之后 —— 收尾的 _bounded_sleep 在点完
-        confirm_sell 之后也会抛, 那次出售可能已经生效。把这种「结果未知」当成满仓失败
-        会连累两处: 放宽品质(可能卖掉用户明确保留的品质)被提前触发, 且 _inventory_stuck
-        一旦被误置, 下一轮会直接跳过拍卖并记一次失败(见 _run_single_round), 仓库其实
-        已空时还会反复触发。所以只有拿到「读数为 0 / 未勾选」这类明确失败证据才累积计数。
+        出售超时(预算耗尽抛 WaitFailedException)与「没有可信证据」的返回(None)同等
+        对待: 两者的确认出售都可能已经生效, 结果未知。把这种结果当成满仓失败会连累
+        两处: 放宽品质(可能卖掉用户明确保留的品质)被无证据的失败提前触发; 且
+        _inventory_stuck 一旦被误置, 下一轮会直接跳过拍卖并记一次失败(见
+        _run_single_round), 仓库其实已空时还会反复触发 —— 2026-09-23 线上 4 次出售
+        有 3 次读不出「出售价值」, 这条路径不是小概率。但满仓时 None 仍要置
+        _inventory_stuck: 仓库若真的还满, 不置位的话下一轮会去空烧匹配阶段,
+        永远轮不到清理 —— 置位才有重试清理的机会。
+
+        「满仓」前提的失效出口: 以放宽集合(6 个品质全勾)出售且要求出售时, 出售价值
+        被**确认**读到 0(重勾后仍为 0), 说明仓库里已经没有任何可出售藏品 —— 满仓
+        结论必然过时(最常见: 上一轮出售结果未确认, 实际已清空仓库)。此时清掉
+        _inventory_stuck 恢复正常拍卖, 不再无限重试「满仓清理」。若判定有误(品质
+        点击全部落空才会如此), 下一轮出价会再次触发满仓提示并重新走清理, 不会更糟。
 
         计数达到阈值后以放宽集合开局(use_escalated): 否则第一次调用就超时的话,
         放宽分支永远走不到。
@@ -3104,15 +3151,30 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
             self._inventory_stuck = False
             return True
 
+        if sold is None:
+            # 确认出售可能已点击(读不出)或流程未走通, 是否清掉藏品未知: 不计入放宽
+            # 计数, 避免无证据的失败驱动放宽(会把要保留的品质一起卖掉); 满仓时置位
+            # 让下一轮先重试清理, 而不是对着满仓空烧匹配阶段.
+            self.log_warning("藏品出售结果未知, 不计入放宽计数")
+            self._inventory_stuck = inventory_full
+            return False
+
         if not inventory_full:
             # 非满仓失败只是读数抖动, 不为将来的满仓放宽积攒「信用」.
             self.log_warning("藏品出售未完成 (非满仓, 不计入放宽计数)")
             self._inventory_stuck = False
             return False
 
+        if use_escalated:
+            # 放宽集合(6 个品质全勾)确认读数为 0: 仓库没有任何可出售藏品, 满仓前提
+            # 已失效, 恢复正常拍卖. 不计失败: 没有东西可卖不是清理失败.
+            self.log_warning("放宽出售清单确认读数为 0, 仓库已无可出售藏品, 满仓前提失效")
+            self._inventory_stuck = False
+            return False
+
         self._sell_failures += 1
-        if self._sell_failures < self.SELL_FAILURE_ESCALATE_AFTER or use_escalated:
-            # 本次已经是放宽后的尝试, 不再重复放宽一次.
+        if self._sell_failures < self.SELL_FAILURE_ESCALATE_AFTER:
+            # 本次失败用的是未放宽清单, 还轮不到放宽.
             self.log_warning(f"藏品出售未完成 (满仓连续 {self._sell_failures} 次)")
             self._inventory_stuck = inventory_full
             return False
@@ -3133,8 +3195,15 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
             self._inventory_stuck = False
             return True
 
-        self.log_warning("放宽出售清单后出售仍未成功, 满仓会导致后续出价失败")
-        self._inventory_stuck = inventory_full
+        if escalated_sold is None:
+            # 放宽后的结果未知: 首次失败已有明确证据(计数保留), 置位让下一轮继续清理;
+            # 那时以放宽集合开局, 读到确认读数后走成功或上面的失效出口.
+            self.log_warning("放宽出售清单后的出售结果未知, 不计入放宽计数")
+            self._inventory_stuck = inventory_full
+            return False
+
+        self.log_warning("放宽出售清单确认读数为 0, 仓库已无可出售藏品, 满仓前提失效")
+        self._inventory_stuck = False
         return False
 
     def _select_quality_filters(
