@@ -8,6 +8,7 @@ from unittest.mock import Mock, PropertyMock, patch
 from ok import TaskDisabledException, WaitFailedException
 from ok.core.config_schema import build_config_fields
 
+import src.tasks.auction.welfare as auction_welfare
 import src.tasks.AutoBidAuctionTask as auction_module
 from src.scene.PositionMap import PositionMap
 from src.tasks.AutoBidAuctionTask import (
@@ -594,7 +595,8 @@ class TestAuctionWelfareQuota(unittest.TestCase):
         task._welfare_daily_limit = 5
         fake_datetime = Mock()
         fake_datetime.now.return_value = now
-        patcher = patch.object(auction_module, "datetime", fake_datetime)
+        # 跨日重置已迁至 auction/welfare.py, 补丁要打在实现所在模块上才能控制时钟。
+        patcher = patch.object(auction_welfare, "datetime", fake_datetime)
         patcher.start()
         self.addCleanup(patcher.stop)
         return task

@@ -1,7 +1,7 @@
 import math
 import re
 import time
-from datetime import date, datetime, timedelta
+from datetime import date
 from decimal import Decimal
 
 from ok import Box, TaskDisabledException, WaitFailedException
@@ -10,15 +10,13 @@ from src.tasks.auction import layout as auction_layout
 from src.tasks.auction import options as auction_options
 from src.tasks.auction import price as auction_price
 from src.tasks.auction import sell as auction_sell
+from src.tasks.auction import welfare as auction_welfare
 from src.tasks.auction.layout import (
-    FULLWIDTH_NUMERIC,
     RE_BID,
     RE_BID_CONFIRM,
     RE_BID_PANEL,
     RE_BID_PANEL_READY,
-    RE_CANCEL,
     RE_CITY_FUN,
-    RE_CLAIM,
     RE_CONFIRM,
     RE_CURRENT_VENUE,
     RE_EXIT,
@@ -27,18 +25,25 @@ from src.tasks.auction.layout import (
     RE_NUMBER,
     RE_PRICE_HINT,
     RE_SKIP,
-    RE_WELFARE,
-    RE_WELFARE_COUNTER,
     AuctionBoxes,
     AuctionState,
     PostRoundState,
 )
 from src.tasks.auction.layout import (
-    # 测试从本模块导入这两个正则; 使用方已迁至 auction/sell.py, 此处显式再导出。
+    RE_CANCEL as RE_CANCEL,
+)
+from src.tasks.auction.layout import (
+    RE_CLAIM as RE_CLAIM,
+)
+from src.tasks.auction.layout import (
+    # 测试从本模块导入这五个正则; 使用方已迁至 auction 子包, 此处显式再导出。
     RE_ONE_CLICK_SELL as RE_ONE_CLICK_SELL,
 )
 from src.tasks.auction.layout import (
     RE_POPUP_CLOSE_HINT as RE_POPUP_CLOSE_HINT,
+)
+from src.tasks.auction.layout import (
+    RE_WELFARE_COUNTER as RE_WELFARE_COUNTER,
 )
 from src.tasks.auction.options import INST
 from src.tasks.BaseNTETask import BaseNTETask
@@ -1159,82 +1164,16 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         self._run_post_round_actions(boxes, deadline)
 
     def _observe_post_round_on_main_screen(self, boxes: AuctionBoxes, deadline: float) -> None:
-        """已经回到主界面时的结算后观测。
-
-        _stage_result 的「返回匹配界面」分支不会走 _finish_auction —— 那里要点「跳过
-        动画」和「退出拍卖」, 而这两个按钮在已经回到主界面的情况下并不存在。但结算后
-        观测必须照做: 少了它, _post_round_state.observed 保持 False, 轮次末尾就不出售,
-        于是满仓时后续每轮都卡在「开始匹配」上(点一次弹一次「库存不足」), 而
-        _inventory_stuck 永远不会置位 —— 「满仓时清理」在这条路径上完全失效。
-
-        仍以主界面标题为准再动手: 只有确认画面是拍卖主界面才做观测, 否则会去点不存在
-        的仓库入口白等超时。
-        """
-        title_timeout = self._timeout_or_zero(deadline, 5)
-        if title_timeout <= 0:
-            return
-        if not self.wait_ocr(
-            box=boxes.main_title,
-            match=RE_MAIN_TITLE,
-            time_out=title_timeout,
-            raise_if_not_found=False,
-            settle_time=0.5,
-        ):
-            self.log_warning("主界面「即刻落槌」标题未识别, 跳过本轮结算后处理")
-            return
-
-        self.log_info("主界面加载完成")
-        self._run_post_round_actions(boxes, deadline)
+        """已经回到主界面时的结算后观测, 实现见 auction_welfare.observe_post_round。"""
+        auction_welfare.observe_post_round(self, boxes, deadline)
 
     def _sell_on_settlement_screen(self, boxes: AuctionBoxes, deadline: float) -> None:
         """结算界面「一键出售」, 实现见 auction_sell.on_settlement_screen。"""
         auction_sell.on_settlement_screen(self, boxes, deadline)
 
     def _run_post_round_actions(self, boxes: AuctionBoxes, deadline: float) -> None:
-        """结算后回到主界面时的辅助操作: 观测满仓状态并领取低保金。
-
-        库存不足提示位于屏幕中部, 会被低保金弹窗遮挡, 因此必须在打开弹窗之前检测。
-
-        这里只观测并把结果写入 _post_round_state, 是否出售由轮次末尾的
-        _sell_collections_on_interval 统一决定。两处都动手会让同一轮卖两次: 第二次
-        面对已被卖空的仓库读到「出售价值 0」, 白白累计失败次数, 最终触发「放宽保留
-        品质」把用户明确要保留的藏品一起卖掉。
-        """
-        # 满仓等提示弹窗会盖住库存不足提示条, 先兜掉再观测, 否则满仓永远检测不到.
-        self._dismiss_notice_popup(boxes, deadline, "结算后主界面")
-
-        # 未检测到一律保持 None(而不是 False): None 表示「本轮未测出结论」, 轮次末尾的
-        # _sell_collections_on_interval 会在那里(deadline 为空, 有完整超时预算)补测一次。
-        # 写成 False 等于宣称「确定没满仓」, 会把满仓静默漏掉。
-        inventory_full: bool | None = None
-        if self._uses_collection_sell():
-            # 观测步骤没有可用时间时返回 None, 不抛异常.
-            inventory_full = self._detect_inventory_full(
-                boxes, self._timeout_or_zero(deadline, self.INVENTORY_FULL_TIMEOUT)
-            )
-
-        # 资产观测无条件执行, 与低保金开关无关: 这是独立的长期记录功能。
-        # 观测失败(未读出)只返回 None, 不影响后续低保金与出售流程。
-        asset_value = self._observe_main_asset(boxes, deadline)
-
-        # 领取结果不再参与出售决策: 追加出售看的是「今日低保是否领完」(任务级状态,
-        # 由弹窗读数维护), 不是「本轮有没有领到」。这里只负责把领取流程走完。
-        if self._assist_enabled(self.ASSIST_WELFARE):
-            try:
-                self._claim_welfare_if_needed(boxes, deadline, asset_value)
-            except TaskDisabledException:
-                raise
-            except WaitFailedException as e:
-                # 低保金领取是可选的收尾动作, 单轮时间用尽时只跳过本次领取.
-                # 让它传播出去会把已经结算成功的轮次判成失败, 而且本方法写回观测结果
-                # 的那一行会被跳过 —— _post_round_state.observed 保持 False, 轮次末尾
-                # 连带跳过出售.
-                self.log_warning(f"低保金领取超时, 跳过本次领取: {e}")
-
-        self._post_round_state = PostRoundState(
-            inventory_full=inventory_full,
-            observed=True,
-        )
+        """结算后的观测与低保领取编排, 执行顺序见 auction_welfare.run_post_round_actions。"""
+        auction_welfare.run_post_round_actions(self, boxes, deadline)
 
     def _sell_mode(self) -> str:
         """读取出售模式, 未知值按「不出售」处理, 规则见 auction_sell.normalize_mode。"""
@@ -1261,48 +1200,14 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         return auction_sell.detect_inventory_full(self, boxes, timeout)
 
     def _observe_main_asset(self, boxes: AuctionBoxes, deadline: float) -> int | None:
-        """读取主界面资产值, 记录到本地历史, 返回数值(未读出时 None)。
-
-        独立于低保金领取: 资产历史记录是用户要的长期观测, 不依赖「启用辅助功能」里
-        是否勾选低保金。两者合在一个方法里时, 用户取消勾选低保金会让整个资产记录
-        静默停摆 —— 任务运行完全正常, 只是数据一条都不写, 极难发现。
-
-        资产读取属于可选的观测步骤, 和 _detect_inventory_full 一样用 _timeout_or_zero:
-        单轮时间用尽时只表示这次没测到, 不该抛 WaitFailedException —— 那会把已经成功
-        结算的轮次判成失败, 而且调用方写回观测结果的那一步会被跳过, 连出售也一并丢失。
-        """
-        timeout = self._timeout_or_zero(deadline, self.ASSET_OBSERVE_TIMEOUT)
-        if timeout <= 0:
-            self.log_debug("资产观测没有可用时间, 跳过本次读取")
-            return None
-
-        # 使用数字 match, 避免漏识别单字符数值 0.
-        asset_value = self._read_asset_value(boxes.main_asset, timeout)
-        if asset_value is None:
-            self.log_warning("资产值识别失败, 跳过本次观测")
-            return None
-
-        self.log_info(f"当前资产: {asset_value}")
-        return asset_value
+        """读取主界面资产值, 实现见 auction_welfare.observe_main_asset。"""
+        return auction_welfare.observe_main_asset(self, boxes, deadline)
 
     def _claim_welfare_if_needed(
         self, boxes: AuctionBoxes, deadline: float, asset_value: int | None
     ) -> bool:
-        """主界面资产低于阈值时领取低保金, 返回是否成功领取。
-
-        asset_value 由调用方通过 _observe_main_asset 读出后传入: 资产观测与低保金领取
-        拆开后, 两者的可用时间互相独立, 一次 OCR 的读数也只采信一次。
-        """
-        if asset_value is None:
-            self.log_warning("资产值识别失败, 跳过本次低保金领取")
-            return False
-
-        if asset_value >= self.WELFARE_ASSET_THRESHOLD:
-            self.log_info(f"资产达到{self.WELFARE_ASSET_THRESHOLD}, 跳过低保金领取")
-            return False
-
-        self.log_info(f"资产低于{self.WELFARE_ASSET_THRESHOLD}, 执行低保金领取")
-        return self._try_claim_welfare(boxes, deadline)
+        """资产低于阈值时领取低保金, 阈值判定见 auction_welfare.claim_if_needed。"""
+        return auction_welfare.claim_if_needed(self, boxes, deadline, asset_value)
 
     # --- 界面状态判定 ---
     def _is_match_screen(self, boxes: AuctionBoxes) -> bool:
@@ -2050,151 +1955,31 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
 
     # --- 低保金 ---
     def _try_claim_welfare(self, boxes: AuctionBoxes, deadline: float | None = None) -> bool:
-        """尝试领取每日低保金, deadline 为空时保持原有独立超时行为。
-
-        低保金是可选的附加流程, 按钮未出现(如当日已领取)或弹窗异常时只跳过本次领取;
-        只有单轮超时才向上传播, 避免拖垮已经成功的拍卖轮次。
-
-        每日次数用尽(如 5/5)时界面仍会打开弹窗但没有领取按钮, 此时必须继续关闭弹窗,
-        否则弹窗会一直盖住拍卖界面, 让后续所有阶段都识别不到。
-        """
-        try:
-            self.log_info("执行低保金领取流程")
-            if not self._wait_click_optional(
-                boxes.welfare_btn, RE_WELFARE, deadline, 5, "低保金按钮"
-            ):
-                return False
-            self._bounded_sleep(deadline, 0.5)
-
-            # 弹窗已经打开了, 顺手把「今日已领取次数：N/5」读回来: 这是「今日低保是否
-            # 领完」的唯一权威读数, 也是轮次末尾要不要追加出售的依据。
-            self._read_welfare_counter(boxes, deadline)
-
-            if self._wait_click_optional(boxes.claim, RE_CLAIM, deadline, 5, "领取按钮"):
-                self._bounded_sleep(deadline, 0.5)
-                self.log_info("已点击领取按钮")
-                # 点击已发出不代表领取已生效: 盲目 +1 会在点击落空时虚增当日次数,
-                # 提前按「已领完」放开出售, 抬高资产后弹窗不再打开, 当天剩下的低保
-                # 就领不到 —— 而且这次读数之后再无弹窗, 计数无法自愈。弹窗还开着,
-                # 直接重读权威读数; 读不到(弹窗领取后自动关闭等)就保持领取前的值:
-                # 少记一次只是少卖几件藏品, 多记一次却会让剩下的低保领不到。
-                self._read_welfare_counter(boxes, deadline)
-            else:
-                self.log_info("未检测到领取按钮(今日次数可能已用尽), 直接关闭低保金弹窗")
-
-            if not self._close_welfare_dialog(boxes, deadline):
-                self.log_warning("低保金弹窗未关闭, 跳过本次领取的后续确认")
-                return False
-
-            self.log_info("低保金领取完成")
-            return True
-        except TaskDisabledException:
-            raise
-        except WaitFailedException:
-            raise
-        except Exception as e:
-            self.log_warning(f"低保金领取失败: {type(e).__name__}: {e}")
-            return False
+        """尝试领取每日低保金, 流程与异常语义见 auction_welfare.try_claim。"""
+        return auction_welfare.try_claim(self, boxes, deadline)
 
     def _is_welfare_dialog_open(self, boxes: AuctionBoxes) -> bool:
-        """检测低保金弹窗是否仍留在界面上。
-
-        标题与取消按钮任一命中即认为弹窗存在, 避免只有其一被识别时误判为已关闭。
-        """
-        if self.ocr(box=boxes.welfare_dialog, match=RE_WELFARE):
-            return True
-        return bool(self.ocr(box=boxes.cancel, match=RE_CANCEL))
+        """检测低保金弹窗是否仍在, 实现见 auction_welfare.is_dialog_open。"""
+        return auction_welfare.is_dialog_open(self, boxes)
 
     def _close_welfare_dialog(self, boxes: AuctionBoxes, deadline: float | None) -> bool:
-        """关闭低保金弹窗, 领取成功与否都必须执行。
-
-        每日次数用尽时弹窗没有领取按钮, 只点领取的旧逻辑会把弹窗留在界面上,
-        后续所有阶段的识别都会被挡住。这里以界面特征判定弹窗是否还在, 反复点击取消,
-        直到弹窗消失或重试次数用尽。
-        """
-        for attempt in range(1, self.WELFARE_CLOSE_RETRIES + 1):
-            if not self._is_welfare_dialog_open(boxes):
-                self.log_info("低保金弹窗已关闭")
-                return True
-
-            self._wait_click_optional(boxes.cancel, RE_CANCEL, deadline, 3, "取消按钮")
-            self._bounded_sleep(deadline, 0.5)
-
-            if not self._is_welfare_dialog_open(boxes):
-                self.log_info("低保金弹窗已关闭")
-                return True
-
-            self.log_warning(
-                f"第 {attempt}/{self.WELFARE_CLOSE_RETRIES} 次点击取消后低保金弹窗仍未关闭"
-            )
-
-        self.log_warning("低保金弹窗多次尝试后仍未关闭")
-        return False
+        """关闭低保金弹窗, 重试语义见 auction_welfare.close_dialog。"""
+        return auction_welfare.close_dialog(self, boxes, deadline)
 
     # --- 低保金领取记录 (决定追加出售是否放开) ---
     def _read_welfare_counter(self, boxes: AuctionBoxes, deadline: float | None = None) -> None:
-        """读弹窗正文的「今日已领取次数：N/5」, 刷新当日已领次数与上限。
-
-        领取流程里会读两次: 打开弹窗后读一次(此时的值用于本轮出售清单决策), 点击
-        领取后再读一次(刷新为领取后的权威读数, 同时纠正点击落空造成的虚计)。
-
-        读数**整体覆盖**本地累计值(而不是取较大者): 弹窗是权威来源, 覆盖能让
-        「本地多记了一次」在下次读数时自愈。读不出时保持原值 —— 「今日已领完」
-        是放开出售的开关, 读不到就必须保守。
-
-        用 `self.ocr(match=None)` 拿区域内全部文本, 而不是 `wait_ocr(match=...)`:
-        后者按 match 过滤返回值。实测这两张截图上「标签 + 数值」被识别成同一个框,
-        两种取法等价; 但检测模型把两者拆成两框时, 过滤会把标签丢掉, 只剩 "0/5"
-        没有可解析的整行 —— 固定用 match=None 拼回整行, 不赌识别粒度。
-
-        换帧重读一次而不是只读一帧: 弹窗淡入途中那一帧可能是空白, 而这次读数一旦
-        落空, 资产涨过 10 万后弹窗就不再打开, 当天再也读不到(阶段永远停在「未领完」,
-        追加出售静默失效)。多花 0.3 秒换掉这个静默失效是划算的。
-        """
-        found = None
-        for attempt in range(1, self.WELFARE_COUNTER_READS + 1):
-            texts = [box.name for box in self.ocr(box=boxes.welfare_counter, match=None)]
-            found = RE_WELFARE_COUNTER.search("".join(texts).translate(FULLWIDTH_NUMERIC))
-            if found is not None:
-                break
-            if attempt < self.WELFARE_COUNTER_READS:
-                self.next_frame()
-                self._bounded_sleep(deadline, self.WELFARE_COUNTER_RETRY_GAP)
-
-        if found is None:
-            self.log_debug("低保金领取次数读数失败, 保持上次记录")
-            return
-
-        self._welfare_claims_today = int(found.group(1))
-        self._welfare_daily_limit = int(found.group(2))
-        self.log_info(f"今日已领取低保 {self._welfare_claims_today}/{self._welfare_daily_limit} 次")
+        """读弹窗的「今日已领取次数：N/5」刷新当日记录, 实现见 auction_welfare.read_counter。"""
+        auction_welfare.read_counter(self, boxes, deadline)
 
     def _welfare_quota_exhausted(self) -> bool:
-        """今日低保次数是否已用尽(今天再也领不到了)。
-
-        没读到过弹窗读数时一律返回 False。两个方向的代价不对称: 判成「没领完」只是
-        少卖几件藏品; 判成「领完了」却会在还能领低保的时候追加出售, 把资产抬过
-        10 万线, 低保就领不到了 —— 所以拿不准时往保守方向兜。
-        """
-        if self._welfare_daily_limit is None:
-            return False
-        return self._welfare_claims_today >= self._welfare_daily_limit
+        """今日低保次数是否已用尽, 保守方向判定见 auction_welfare.quota_exhausted。"""
+        return auction_welfare.quota_exhausted(
+            self._welfare_claims_today, self._welfare_daily_limit
+        )
 
     def _rollover_welfare_day(self) -> None:
-        """跨过游戏每日刷新时刻时清空当日低保领取记录。
-
-        按 5 点切分而不是自然日午夜: 游戏每日刷新在 5 点(与 src/config.py 的
-        「Monthly Card Time」默认值、BaseNTETask 算 next_monthly_card_start 用的
-        是同一个小时)。按午夜切会让 0~5 点这段被当成新的一天, 方向是「以为还能领 →
-        不追加出售」, 虽然保守, 但会让这几轮白等一次弹窗读数。
-        """
-        day = (datetime.now() - timedelta(hours=self.WELFARE_RESET_HOUR)).date()
-        if self._welfare_day == day:
-            return
-
-        self._welfare_day = day
-        self._welfare_claims_today = 0
-        self._welfare_daily_limit = None
+        """跨过每日刷新时刻清空当日领取记录, 切日规则见 auction_welfare.rollover_day。"""
+        auction_welfare.rollover_day(self)
 
     def _wait_click_optional(
         self,
