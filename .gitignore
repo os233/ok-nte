@@ -84,3 +84,6 @@ tmp*/
 .tmp_qt/
 tests/.tmp/
 .workbuddy-ai/
+
+# ZCode 本地会话数据
+.zcode/
