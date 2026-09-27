@@ -6,23 +6,18 @@ from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 from ok import Box, TaskDisabledException, WaitFailedException
 
-from src.tasks.BaseNTETask import BaseNTETask
-from src.tasks.NTEOneTimeTask import NTEOneTimeTask
 from src.tasks.auction import layout as auction_layout
 from src.tasks.auction import options as auction_options
 from src.tasks.auction.layout import (
     FULLWIDTH_NUMERIC,
     PAD_SHORTCUTS,
-    AuctionBoxes,
-    AuctionState,
-    PostRoundState,
     RE_BID,
     RE_BID_CONFIRM,
     RE_BID_PANEL,
     RE_BID_PANEL_READY,
     RE_CANCEL,
-    RE_CLAIM,
     RE_CITY_FUN,
+    RE_CLAIM,
     RE_COLLECTION_INSUFFICIENT,
     RE_CONFIRM,
     RE_CURRENT_VENUE,
@@ -38,8 +33,13 @@ from src.tasks.auction.layout import (
     RE_WAREHOUSE,
     RE_WELFARE,
     RE_WELFARE_COUNTER,
+    AuctionBoxes,
+    AuctionState,
+    PostRoundState,
 )
 from src.tasks.auction.options import INST
+from src.tasks.BaseNTETask import BaseNTETask
+from src.tasks.NTEOneTimeTask import NTEOneTimeTask
 
 
 class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
@@ -89,7 +89,6 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
     ASSIST_FEATURES = auction_options.ASSIST_FEATURES
     QUALITY_KEYS = auction_options.QUALITY_KEYS
     SPECIAL_ROUND_OPTIONS = auction_options.SPECIAL_ROUND_OPTIONS
-
 
     # --- UI 坐标 (兼容别名) ---
     # 区域常量唯一来源: src/tasks/auction/layout.py (含 AuctionBoxes 与 OCR 正则),
@@ -2369,9 +2368,7 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
 
         self._welfare_claims_today = int(found.group(1))
         self._welfare_daily_limit = int(found.group(2))
-        self.log_info(
-            f"今日已领取低保 {self._welfare_claims_today}/{self._welfare_daily_limit} 次"
-        )
+        self.log_info(f"今日已领取低保 {self._welfare_claims_today}/{self._welfare_daily_limit} 次")
 
     def _welfare_quota_exhausted(self) -> bool:
         """今日低保次数是否已用尽(今天再也领不到了)。
@@ -2623,9 +2620,7 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
 
     def _is_warehouse_open(self, boxes: AuctionBoxes) -> bool:
         """检测藏品仓库界面是否还在, 复用标题区域的 OCR。"""
-        return bool(
-            self.ocr(box=boxes.warehouse_title, match=RE_WAREHOUSE, log=False)
-        )
+        return bool(self.ocr(box=boxes.warehouse_title, match=RE_WAREHOUSE, log=False))
 
     @staticmethod
     def _is_selection_confirmed(
@@ -2745,9 +2740,7 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
 
         self.log_warning(f"藏品出售连续 {self._sell_failures} 次未完成, 放宽出售清单重试一次")
         try:
-            escalated_sold = self._sell_collections(
-                boxes, deadline, escalated, require_sale=True
-            )
+            escalated_sold = self._sell_collections(boxes, deadline, escalated, require_sale=True)
         except WaitFailedException as e:
             # 同上一处: 放宽后的这次出售是否生效同样无法确认, 保持计数与 _inventory_stuck
             # 不变, 交给下一轮的实测结论决定.
