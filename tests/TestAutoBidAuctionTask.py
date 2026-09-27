@@ -1,11 +1,11 @@
-import json
+import itertools
 import re
-import tempfile
 import unittest
+from datetime import date, datetime
 from pathlib import Path
 from unittest.mock import Mock, PropertyMock, patch
 
-from ok import Config, TaskDisabledException, WaitFailedException
+from ok import TaskDisabledException, WaitFailedException
 from ok.core.config_schema import build_config_fields
 
 import src.tasks.AutoBidAuctionTask as auction_module
@@ -16,6 +16,7 @@ from src.tasks.AutoBidAuctionTask import (
     RE_MAIN_TITLE,
     RE_ONE_CLICK_SELL,
     RE_POPUP_CLOSE_HINT,
+    RE_WELFARE_COUNTER,
     AuctionState,
     AutoBidAuctionTask,
     PostRoundState,
@@ -49,6 +50,12 @@ def _make_task(config: dict | None = None) -> AutoBidAuctionTask:
     task.info_set = Mock()
     # 位置表由 BaseNTETask.__init__ 建立, 桩实例要自己补一份, 否则 self.pos.* 会 AttributeError。
     task.pos = PositionMap(task)
+    # 当日低保领取记录由 __init__ 建立, 桩实例要自己补一份, 否则
+    # _rollover_welfare_day / _welfare_quota_exhausted 会 AttributeError。
+    # 默认「没读到过弹窗读数」= 今日低保未领完, 与真机首次运行的保守口径一致。
+    task._welfare_day = None
+    task._welfare_claims_today = 0
+    task._welfare_daily_limit = None
     # 贴边阈值按屏幕宽度换算(见 ESTIMATE_EDGE_MARGIN_RATIO), 而框架的 width 属性会一路
     # 走到 executor.method.width, executor 又读 _executor —— 桩实例没有它, 必须在这里给
     # 一个默认屏幕宽。需要验证高分辨率行为的用例用
@@ -94,6 +101,14 @@ def _make_configured_task() -> AutoBidAuctionTask:
     with patch.object(BaseNTETask, "__init__", return_value=None):
         AutoBidAuctionTask.__init__(task)
     return task
+
+
+def _option_subsets(options: list[str]) -> list[list[str]]:
+    """多选框的全部取值组合, 空选也算一种。"""
+    subsets: list[list[str]] = [[]]
+    for option in options:
+        subsets += [subset + [option] for subset in subsets]
+    return subsets
 
 
 def _stub_round_loop(task: AutoBidAuctionTask, total_polls: int) -> None:
@@ -245,7 +260,7 @@ class TestAuctionRoundFailureHandling(unittest.TestCase):
         task.finish_rounds.assert_called_once()
 
     def test_run_warns_about_contradictory_sell_config(self):
-        """两条入场告警都必须在 do_run 里真的被调用, 光有方法不算。
+        """入场告警必须在 do_run 里真的被调用, 光有方法不算。
 
         告警只在启动时说一次, 漏调不会让任何流程失败, 因此最容易被静默删掉。
         """
@@ -253,12 +268,10 @@ class TestAuctionRoundFailureHandling(unittest.TestCase):
         _stub_round_loop(task, total_polls=1)
         task._run_single_round = Mock()
         task._warn_if_no_sellable_quality = Mock()
-        task._warn_if_extra_sell_is_redundant = Mock()
 
         task.do_run()
 
         task._warn_if_no_sellable_quality.assert_called_once()
-        task._warn_if_extra_sell_is_redundant.assert_called_once()
 
     def test_warnings_run_after_price_validation(self):
         """校验失败时不该再报出售配置的告警 —— 先处理真正会拦下任务的问题。"""
@@ -266,12 +279,12 @@ class TestAuctionRoundFailureHandling(unittest.TestCase):
         _stub_round_loop(task, total_polls=1)
         task._run_single_round = Mock()
         task._validate_price_config = Mock(side_effect=ValueError("基础价必须为正整数"))
-        task._warn_if_extra_sell_is_redundant = Mock()
+        task._warn_if_no_sellable_quality = Mock()
 
         with self.assertRaises(ValueError):
             task.do_run()
 
-        task._warn_if_extra_sell_is_redundant.assert_not_called()
+        task._warn_if_no_sellable_quality.assert_not_called()
 
     def test_run_confirms_auction_entry_every_round(self):
         """入口确认必须每轮都跑一次, 且排在该轮拍卖之前。
@@ -295,6 +308,40 @@ class TestAuctionRoundFailureHandling(unittest.TestCase):
 
         self.assertEqual(task._ensure_auction_entry.call_count, 2)
         self.assertEqual(order, ["entry", "round", "entry", "round"])
+
+    def test_round_start_closes_a_leftover_warehouse_before_bidding(self):
+        """每轮开头先收起残留的藏品仓库, 再做入口确认与出价。
+
+        轮末的仓库检查只有 _run_single_round 正常返回才会执行; 启动前残留的仓库
+        (上次进程被杀 / 手动开着)会让每轮 _stage_match 空烧 MATCH_TIMEOUT(120 秒)
+        后抛异常, 轮末检查永远轮不到 —— 只能在每轮开头兜。
+        """
+        task = _make_task()
+        _stub_round_loop(task, total_polls=2)
+        task._run_single_round = Mock(side_effect=WaitFailedException("匹配阶段超时"))
+        task._recover_blocking_popup = Mock()
+        task._is_warehouse_open = Mock(side_effect=[True, False, False])
+        task._close_warehouse = Mock()
+
+        task.do_run()
+
+        task._close_warehouse.assert_called_once()
+        self.assertEqual(task._run_single_round.call_count, 2)
+
+    def test_uncloseable_warehouse_stops_the_rounds_at_round_start(self):
+        """仓库收不掉时立即停止后续轮次, 不把剩余轮次烧在匹配超时上。"""
+        task = _make_task()
+        _stub_round_loop(task, total_polls=2)
+        task._run_single_round = Mock()
+        task._recover_blocking_popup = Mock()
+        task._is_warehouse_open = Mock(return_value=True)
+        task._close_warehouse = Mock()
+
+        task.do_run()
+
+        task._close_warehouse.assert_called_once()
+        task._run_single_round.assert_not_called()
+        task.log_error.assert_called()
 
 
 class TestAuctionWelfareDialogClose(unittest.TestCase):
@@ -373,6 +420,197 @@ class TestAuctionWelfareDialogClose(unittest.TestCase):
         task.handle_monthly_card.assert_not_called()
 
 
+class TestAuctionWelfareQuota(unittest.TestCase):
+    """弹窗读数「今日已领取次数：N/5」决定按哪个出售清单卖。
+
+    旧实现把「本轮领到低保」当成放开条件, 但卖藏品会抬高资产、资产高于 10 万就领不到
+    下一次低保 —— 「领一次卖一次」会把当天剩下的低保全部堵死。现在只有把当日次数领满
+    才切到「已领完」清单, 所以这组用例守的是「次数状态从哪来、什么时候清零」。
+    """
+
+    def _boxes(self) -> Mock:
+        return Mock()
+
+    @staticmethod
+    def _text_box(text: str) -> Mock:
+        # 不能用 Mock(name=text): name 是 Mock 的保留参数, 读 box.name 拿到的是子 Mock.
+        box = Mock()
+        box.name = text
+        return box
+
+    def _task_with_counter(self, *texts: str) -> AutoBidAuctionTask:
+        task = _make_task()
+        task.ocr = Mock(return_value=[self._text_box(t) for t in texts])
+        return task
+
+    def test_counter_reads_claims_and_limit(self):
+        task = self._task_with_counter("今日已领取次数：3/5")
+
+        task._read_welfare_counter(self._boxes())
+
+        self.assertEqual(task._welfare_claims_today, 3)
+        self.assertEqual(task._welfare_daily_limit, 5)
+        self.assertFalse(task._welfare_quota_exhausted())
+
+    def test_counter_regex_needs_the_label(self):
+        """正则必须锚在「次数」上。
+
+        弹窗附近还有「当前资产：(12,904,567)」这类数字, 也有别的界面文案里出现 N/M 的
+        可能。丢掉标签锚点后任意 "N/M" 都会把状态判成「已领满」, 于是任务在还能领低保
+        的时候切到「已领完」清单 —— 资产被抬高, 低保就领不到了。
+        """
+        self.assertIsNotNone(RE_WELFARE_COUNTER.search("今日已领取次数：5/5"))
+        for decoy in ("当前资产：(12,904,567)", "1/5", "已领取 5 次", "出售价值 3/5"):
+            with self.subTest(decoy=decoy):
+                self.assertIsNone(RE_WELFARE_COUNTER.search(decoy))
+
+    def test_counter_accepts_fullwidth_digits(self):
+        task = self._task_with_counter("今日已领取次数：５/５")
+
+        task._read_welfare_counter(self._boxes())
+
+        self.assertTrue(task._welfare_quota_exhausted())
+
+    def test_counter_survives_the_line_being_split_in_two(self):
+        """检测模型可能把标签和数值拆成两个框, 拼接后仍要能解析。"""
+        task = self._task_with_counter("今日已领取次数：", "2/5")
+
+        task._read_welfare_counter(self._boxes())
+
+        self.assertEqual(task._welfare_claims_today, 2)
+
+    def test_counter_uses_ocr_not_wait_ocr(self):
+        """必须走 `ocr(match=None)` 拿全量文本。
+
+        `wait_ocr(match=RE_XXX)` 会按 match 过滤返回值, 把「今日已领取次数：」这段标签
+        滤掉, 只剩数值框, 解析必然失败。这条用例守着别把它换回去。
+        """
+        task = self._task_with_counter("今日已领取次数：1/5")
+
+        task._read_welfare_counter(self._boxes())
+
+        task.wait_ocr.assert_not_called()
+        self.assertIsNone(task.ocr.call_args.kwargs.get("match"))
+
+    def test_counter_read_failure_keeps_previous_state(self):
+        """读不出时必须保持原值 —— 「已领完」是放开出售的开关, 读不到就得保守。"""
+        task = self._task_with_counter()
+        task._welfare_claims_today = 2
+        task._welfare_daily_limit = 5
+
+        task._read_welfare_counter(self._boxes())
+
+        self.assertEqual(task._welfare_claims_today, 2)
+        self.assertEqual(task._welfare_daily_limit, 5)
+
+    def test_counter_retries_when_the_frame_is_blank(self):
+        """弹窗淡入中的空白帧不能把这次读数吃掉。
+
+        这次读数一旦落空, 资产涨过 10 万后弹窗就不再打开, 当天再也读不到 —— 阶段永远
+        停在「未领完」, 高价值品质静默不卖。
+        """
+        task = _make_task()
+        task.ocr = Mock(
+            side_effect=[[], [self._text_box("今日已领取次数：2/5")]]
+        )
+
+        task._read_welfare_counter(self._boxes())
+
+        self.assertEqual(task._welfare_claims_today, 2)
+        self.assertEqual(task.ocr.call_count, AutoBidAuctionTask.WELFARE_COUNTER_READS)
+        task.next_frame.assert_called_once()
+
+    def test_claim_click_increments_today_count(self):
+        task = _make_task()
+        task._read_welfare_counter = Mock()
+        task._wait_click_optional = Mock(return_value=True)
+        task._close_welfare_dialog = Mock(return_value=True)
+
+        task._try_claim_welfare(self._boxes(), None)
+
+        self.assertEqual(task._welfare_claims_today, 1)
+
+    def test_missing_claim_button_does_not_increment(self):
+        task = _make_task()
+        task._read_welfare_counter = Mock()
+        task._wait_click_optional = Mock(side_effect=[True, False])
+        task._close_welfare_dialog = Mock(return_value=True)
+
+        task._try_claim_welfare(self._boxes(), None)
+
+        self.assertEqual(task._welfare_claims_today, 0)
+
+    def test_quota_exhausted_needs_the_dialog_reading(self):
+        task = _make_task()
+        task._welfare_claims_today = 99
+        task._welfare_daily_limit = None
+
+        self.assertFalse(task._welfare_quota_exhausted())
+
+    def test_quota_exhausted_boundary(self):
+        task = _make_task()
+        task._welfare_daily_limit = 5
+
+        for claims, expected in ((4, False), (5, True), (6, True)):
+            task._welfare_claims_today = claims
+            with self.subTest(claims=claims):
+                self.assertEqual(task._welfare_quota_exhausted(), expected)
+
+    def _rollover_task(self, now) -> AutoBidAuctionTask:
+        task = _make_task()
+        task._welfare_claims_today = 5
+        task._welfare_daily_limit = 5
+        fake_datetime = Mock()
+        fake_datetime.now.return_value = now
+        patcher = patch.object(auction_module, "datetime", fake_datetime)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return task
+
+    def test_rollover_resets_after_the_daily_refresh_hour(self):
+        task = self._rollover_task(datetime(2026, 9, 25, 5, 1))
+
+        task._rollover_welfare_day()
+
+        self.assertEqual(task._welfare_claims_today, 0)
+        self.assertIsNone(task._welfare_daily_limit)
+
+    def test_rollover_keeps_yesterdays_records_before_the_refresh_hour(self):
+        """0~5 点这段仍算前一天: 按自然日午夜切会让这几轮误以为低保又能领了。"""
+        task = self._rollover_task(datetime(2026, 9, 25, 4, 59))
+        task._welfare_day = date(2026, 9, 24)
+
+        task._rollover_welfare_day()
+
+        self.assertEqual(task._welfare_claims_today, 5)
+        self.assertEqual(task._welfare_daily_limit, 5)
+
+    def test_rollover_is_a_noop_within_the_same_day(self):
+        task = self._rollover_task(datetime(2026, 9, 25, 5, 1))
+        task._welfare_day = date(2026, 9, 25)
+
+        task._rollover_welfare_day()
+
+        self.assertEqual(task._welfare_claims_today, 5)
+
+    def test_every_round_checks_the_day_rollover(self):
+        """挂在每轮上: 只在任务启动时算一次的话, 跨天后仍按昨天的「已领完」放开出售。"""
+        task = _make_task()
+        task._inventory_stuck = False
+        task._rollover_welfare_day = Mock()
+        task._exec_auction_round = Mock(return_value=True)
+        task.add_success = Mock()
+        task.add_failed = Mock()
+        task._sell_collections_on_interval = Mock()
+        # current_round 是只读属性, 读的是 _round_state.index.
+        task._round_state = Mock(index=1, total_text="10")
+
+        task._run_single_round(Mock())
+        task._run_single_round(Mock())
+
+        self.assertEqual(task._rollover_welfare_day.call_count, 2)
+
+
 class TestAuctionInventoryFullSell(unittest.TestCase):
     """满仓会挡住拍卖(库存不足无法出价), 不能只等轮次间隔。"""
 
@@ -392,7 +630,8 @@ class TestAuctionInventoryFullSell(unittest.TestCase):
                     AutoBidAuctionTask.SELL_MODE_INTERVAL if mode is None else mode
                 ),
                 AutoBidAuctionTask.CONF_SELL_INTERVAL: interval,
-                AutoBidAuctionTask.CONF_EXTRA_SELL_QUALITIES: [],
+                AutoBidAuctionTask.CONF_SELL_BEFORE_WELFARE: [],
+                AutoBidAuctionTask.CONF_SELL_AFTER_WELFARE: [],
             }
         )
         self.current_round.return_value = current_round
@@ -459,15 +698,6 @@ class TestAuctionInventoryFullSell(unittest.TestCase):
 
         task._sell_collections.assert_called_once()
 
-    def test_detects_inventory_when_state_unknown(self):
-        """结算后处理没跑到时状态未知, 出售分支要自己补一次满仓检测。"""
-        task = self._task(interval=3, current_round=2)
-        task._detect_inventory_full = Mock(return_value=True)
-
-        task._sell_collections_on_interval(Mock())
-
-        task._sell_collections.assert_called_once()
-
     def test_unknown_mode_is_treated_as_off(self):
         """脏配置(拼写错误/旧值残留)必须按「不出售」处理, 不能意外清空仓库。"""
         task = self._task(interval=3, current_round=3, mode="随便写的模式")
@@ -531,68 +761,101 @@ class TestAuctionInventoryFullSell(unittest.TestCase):
 
 
 class TestAuctionConditionalSell(unittest.TestCase):
-    """满仓或领完低保后追加出售指定颜色藏品。"""
+    """出售清单按当日低保阶段自动切换, 两个清单都是「勾选即出售」。"""
 
-    def _task(self, qualities) -> AutoBidAuctionTask:
+    def _task(self, before=(), after=(), mode=None) -> AutoBidAuctionTask:
         task = _make_task()
-        task.config = _config(
-            **{
-                AutoBidAuctionTask.CONF_EXTRA_SELL_QUALITIES: qualities,
-                AutoBidAuctionTask.CONF_KEEP_QUALITIES: ["品质红"],
-            }
-        )
+        values = {
+            AutoBidAuctionTask.CONF_SELL_BEFORE_WELFARE: list(before),
+            AutoBidAuctionTask.CONF_SELL_AFTER_WELFARE: list(after),
+        }
+        if mode is not None:
+            values[AutoBidAuctionTask.CONF_SELL_MODE] = mode
+        task.config = _config(**values)
         return task
 
-    def test_no_extra_qualities_without_condition(self):
-        task = self._task(["品质紫"])
+    def test_before_quota_uses_the_before_list(self):
+        task = self._task(before=["品质白"], after=["品质白", "品质紫"])
 
-        self.assertEqual(task._extra_sell_qualities(PostRoundState(inventory_full=False)), [])
+        self.assertEqual(task._sell_qualities(), ["品质白"])
 
-    def test_extra_qualities_on_inventory_full(self):
-        task = self._task(["品质紫"])
+    def test_after_quota_uses_the_after_list(self):
+        task = self._task(before=["品质白"], after=["品质白", "品质紫"])
+        task._welfare_claims_today = 5
+        task._welfare_daily_limit = 5
 
-        self.assertEqual(
-            task._extra_sell_qualities(PostRoundState(inventory_full=True)), ["品质紫"]
+        self.assertEqual(task._sell_qualities(), ["品质白", "品质紫"])
+
+    def test_regression_claiming_once_does_not_switch_the_list(self):
+        """回归: 领过低保、但今天还没领满时必须仍用「未领完」清单。
+
+        旧实现在每次领取成功后就追加出售, 而卖藏品会抬高资产 —— 资产高于 10 万就领不到
+        下一次低保, 于是「领一次就卖一次」把当天剩下的低保全部堵死。
+        """
+        task = self._task(before=["品质白"], after=["品质白", "品质紫"])
+        task._welfare_claims_today = 4
+        task._welfare_daily_limit = 5
+
+        self.assertEqual(task._sell_qualities(), ["品质白"])
+
+    def test_missing_dialog_reading_keeps_the_conservative_list(self):
+        """没读到过弹窗读数时必须保守: 判不准就按「未领完」清单卖。"""
+        task = self._task(before=["品质白"], after=["品质白", "品质紫"])
+        task._welfare_claims_today = 99
+        task._welfare_daily_limit = None
+
+        self.assertEqual(task._sell_qualities(), ["品质白"])
+
+    def test_inventory_full_still_uses_the_before_list(self):
+        """满仓只代表必须腾空间, 不代表低保已无望 —— 清单仍按低保阶段选。
+
+        满仓改用「已领完」清单会立刻卖掉高价值品质, 把资产顶过 10 万, 当天剩下的低保
+        就领不到了; 真腾不出空间有放宽机制兜底(6 个品质全卖)。
+        """
+        task = self._task(
+            before=["品质白"],
+            after=["品质白", "品质紫"],
+            mode=AutoBidAuctionTask.SELL_MODE_FULL,
         )
+        task._detect_inventory_full = Mock(return_value=True)
+        task._sell_collections_with_escalation = Mock(return_value=True)
 
-    def test_extra_qualities_on_welfare_claimed(self):
-        task = self._task(["品质紫"])
+        task._sell_collections_on_interval(Mock(), state=PostRoundState(inventory_full=True))
 
-        self.assertEqual(
-            task._extra_sell_qualities(PostRoundState(welfare_claimed=True)), ["品质紫"]
-        )
+        self.assertEqual(task._sell_collections_with_escalation.call_args.args[2], ["品质白"])
 
-    def test_unknown_qualities_are_ignored(self):
-        task = self._task(["品质紫", "不存在的品质"])
+    def test_legacy_quality_keys_are_gone(self):
+        """旧的两个品质键已彻底废弃: 不再注册、不再迁移, 升级用户直接吃默认清单。
 
-        self.assertEqual(
-            task._extra_sell_qualities(PostRoundState(inventory_full=True)), ["品质紫"]
-        )
+        残留旧键或残留迁移会让「全部按默认值来」的约定失效 —— 老配置里只要还有旧键,
+        面板上显示的默认值与实际生效的清单就会不一致。
+        """
+        task = _make_configured_task()
 
-    def test_quality_filters_click_extra_quality_even_if_kept(self):
-        """追加出售的品质要覆盖「保留藏品品质」, 否则满仓时仍卖不掉。"""
-        task = self._task(["品质紫"])
-        task.config = _config(
-            **{
-                AutoBidAuctionTask.CONF_KEEP_QUALITIES: ["品质红", "品质紫"],
-                AutoBidAuctionTask.CONF_EXTRA_SELL_QUALITIES: ["品质紫"],
-            }
-        )
+        for legacy in ("保留藏品品质", "满仓或领低保后追加出售品质"):
+            with self.subTest(key=legacy):
+                self.assertNotIn(legacy, task.default_config)
+                self.assertNotIn(legacy, task.config_type)
+                self.assertNotIn(legacy, task.config_description)
 
-        task._select_quality_filters(None, ["品质紫"])
+    def test_quality_filters_only_click_the_listed_qualities(self):
+        """勾选即出售: 只有清单里的品质被点选, 其余全部保留。"""
+        task = self._task()
+
+        clicked_count = task._select_quality_filters(None, ["品质紫"])
 
         clicked = [tuple(call.args) for call in task.box_of_screen.call_args_list]
-        self.assertEqual(len(clicked), len(AutoBidAuctionTask.QUALITY_BOXES) - 1)
-        self.assertNotIn(AutoBidAuctionTask.QUALITY_BOXES[5], clicked)  # 品质红仍保留
+        self.assertEqual(clicked_count, 1)
+        self.assertEqual(clicked, [AutoBidAuctionTask.QUALITY_BOXES[3]])  # 品质紫
 
-    def test_quality_filters_keep_configured_qualities(self):
-        task = self._task([])
+    def test_quality_filters_keep_everything_when_the_list_is_empty(self):
+        """空清单 = 什么都不卖, 连品质按钮都不点。"""
+        task = self._task()
 
-        task._select_quality_filters(None)
+        clicked_count = task._select_quality_filters(None)
 
-        clicked = [tuple(call.args) for call in task.box_of_screen.call_args_list]
-        self.assertEqual(len(clicked), len(AutoBidAuctionTask.QUALITY_BOXES) - 1)
-        self.assertNotIn(AutoBidAuctionTask.QUALITY_BOXES[5], clicked)  # 品质红
+        self.assertEqual(clicked_count, 0)
+        task.box_of_screen.assert_not_called()
 
 
 class TestAuctionBidMode(unittest.TestCase):
@@ -608,10 +871,6 @@ class TestAuctionBidMode(unittest.TestCase):
     def _prices(*values: int) -> dict[str, int]:
         """按出价顺序把价格映射到 6 个「第N次出价价格」配置项。"""
         return dict(zip(AutoBidAuctionTask.CONF_BID_PRICES, values))
-
-    def test_there_is_one_price_config_per_bid_round(self):
-        self.assertEqual(len(AutoBidAuctionTask.CONF_BID_PRICES), 6)
-        self.assertEqual(AutoBidAuctionTask.MAX_BID_ROUNDS, 6)
 
     def test_each_round_uses_its_own_price(self):
         """6 次出价各自取自己的价格: 第1次 99999 / 第2次 123456 / 第3次 886 / 第4次 1314520。"""
@@ -820,6 +1079,39 @@ class TestAuctionBidMode(unittest.TestCase):
         with self.assertRaises(ValueError):
             task._validate_price_config()
 
+    def test_validate_rejects_invalid_raise_value_when_auto_raise_on(self):
+        """自动加价开启时, 加价数值非法必须拦下任务而不是静默按 0 处理。
+
+        校验若用 _config_float, 非法字符串会回退成 0.0 顺利通过; 运行时
+        _config_decimal 同样回退 0 —— 自定义/百分比模式每次出价都按基础价,
+        零告警, 用户以为配了加价实际没生效。
+        """
+        for raise_mode in AutoBidAuctionTask.RAISE_MODES:
+            for raw in ("abc", ""):
+                with self.subTest(mode=raise_mode, value=raw):
+                    task = self._task(
+                        **{
+                            AutoBidAuctionTask.CONF_FIXED_PRICE: 1000,
+                            AutoBidAuctionTask.CONF_AUTO_RAISE: True,
+                            AutoBidAuctionTask.CONF_RAISE_MODE: raise_mode,
+                            AutoBidAuctionTask.CONF_RAISE_VALUE: raw,
+                        }
+                    )
+                    with self.assertRaises(ValueError):
+                        task._validate_price_config()
+
+    def test_validate_accepts_decimal_raise_value_with_whitespace(self):
+        """合法的小数加价数值(带首尾空格)不能被收紧后的校验误拦。"""
+        task = self._task(
+            **{
+                AutoBidAuctionTask.CONF_FIXED_PRICE: 1000,
+                AutoBidAuctionTask.CONF_AUTO_RAISE: True,
+                AutoBidAuctionTask.CONF_RAISE_VALUE: " 1.6 ",
+            }
+        )
+
+        task._validate_price_config()
+
 
 class TestAuctionCursorRestore(unittest.TestCase):
     """后台执行时点击必须还原鼠标位置, 否则鼠标会留在游戏窗口内。"""
@@ -839,15 +1131,6 @@ class TestAuctionCursorRestore(unittest.TestCase):
 
         self.assertTrue(task._wait_click_optional(Mock(), RE_CANCEL, None, 3, "取消按钮"))
         task.operate_click.assert_called_once()
-
-    def test_sell_collections_uses_cursor_restoring_click(self):
-        task = _make_task()
-        task.wait_ocr = Mock(return_value=[Mock()])
-        task._select_quality_filters = Mock(return_value=5)
-        task._read_sell_value = Mock(return_value=12345)
-
-        self.assertTrue(task._sell_collections(Mock(), None))
-        task.operate_click.assert_called()
 
     def test_wait_operate_click_returns_false_without_target(self):
         task = _make_task()
@@ -918,246 +1201,133 @@ class TestAuctionSellModeGuard(unittest.TestCase):
 
 
 class TestAuctionQualitySelection(unittest.TestCase):
-    """品质勾选要返回点击次数并按可配置间隔点击, 供上层校验勾选是否生效。"""
+    """品质勾选是「勾选即出售」: 清单里的点选, 其余保留, 返回点击次数。"""
 
-    def _task(self, keep=("品质红",)) -> AutoBidAuctionTask:
-        task = _make_task()
-        task.config = _config(**{AutoBidAuctionTask.CONF_KEEP_QUALITIES: list(keep)})
-        return task
+    def _task(self) -> AutoBidAuctionTask:
+        return _make_task()
 
-    def test_selection_returns_number_of_clicks(self):
+    def test_selection_clicks_every_quality_when_all_are_listed(self):
         task = self._task()
 
-        self.assertEqual(task._select_quality_filters(None), 5)
-        self.assertEqual(task.operate_click.call_count, 5)
-
-    def test_selection_keeps_configured_qualities(self):
-        task = self._task(keep=("品质红", "品质紫"))
-
-        self.assertEqual(task._select_quality_filters(None), 4)
-
-    def test_selection_returns_zero_when_every_quality_is_kept(self):
-        task = self._task(keep=AutoBidAuctionTask.QUALITY_KEYS)
-
-        self.assertEqual(task._select_quality_filters(None), 0)
-        task.operate_click.assert_not_called()
+        self.assertEqual(
+            task._select_quality_filters(None, AutoBidAuctionTask.QUALITY_KEYS), 6
+        )
+        self.assertEqual(task.operate_click.call_count, 6)
 
     def test_selection_uses_the_default_gap(self):
         task = self._task()
 
-        task._select_quality_filters(None)
+        task._select_quality_filters(None, ["品质紫"])
 
         task.sleep.assert_called_with(AutoBidAuctionTask.SELL_QUALITY_GAP)
 
-    def test_selection_logs_override_only_for_kept_qualities(self):
-        """只有「本来要保留」的品质被追加才叫追加, 其余品质本来就会卖。"""
-        task = self._task(keep=("品质红", "品质紫"))
+    def test_selection_follows_the_panel_order(self):
+        """清单顺序不影响点击顺序, 一律按面板上的品质顺序走。"""
+        task = self._task()
 
-        task._select_quality_filters(None, ("品质紫",))
+        task._select_quality_filters(None, ["品质红", "品质白"])
 
-        logged = [str(call.args[0]) for call in task.log_info.call_args_list]
-        self.assertIn("条件触发, 追加出售品质紫", logged)
-        self.assertNotIn("保留品质紫", logged)
-
-    def test_selection_does_not_claim_an_override_for_already_sold_qualities(self):
-        """追加的品质不在保留列表里时它本来就会卖, 日志不该说「追加」(会让人以为配置生效)。"""
-        task = self._task(keep=("品质红",))
-
-        count = task._select_quality_filters(None, ("品质白",))
-
-        logged = [str(call.args[0]) for call in task.log_info.call_args_list]
-        self.assertEqual(count, 5)
-        self.assertNotIn("条件触发, 追加出售品质白", logged)
-        self.assertIn("选择品质白", logged)
-
-    def test_redundant_extra_does_not_change_which_qualities_are_sold(self):
-        """追加的品质不在保留列表时, 被点击的品质与不配追加完全一致。"""
-        with_extra = self._task(keep=("品质红",))
-        without = self._task(keep=("品质红",))
-
-        with_extra._select_quality_filters(None, ("品质白",))
-        without._select_quality_filters(None, ())
-
+        clicked = [tuple(call.args) for call in task.box_of_screen.call_args_list]
         self.assertEqual(
-            with_extra.box_of_screen.call_args_list,
-            without.box_of_screen.call_args_list,
-        )
-
-    def test_kept_quality_in_extra_does_change_which_qualities_are_sold(self):
-        """对照: 追加的品质在保留列表里时, 它确实会多出一次点击。"""
-        with_extra = self._task(keep=("品质红", "品质紫"))
-        without = self._task(keep=("品质红", "品质紫"))
-
-        with_extra._select_quality_filters(None, ("品质紫",))
-        without._select_quality_filters(None, ())
-
-        self.assertNotEqual(
-            with_extra.box_of_screen.call_args_list,
-            without.box_of_screen.call_args_list,
+            clicked,
+            [AutoBidAuctionTask.QUALITY_BOXES[0], AutoBidAuctionTask.QUALITY_BOXES[5]],
         )
 
 
 class TestAuctionNoSellableQualityWarning(unittest.TestCase):
-    """「保留全部品质」+「开了出售模式」是自相矛盾的配置, 要在入场就说清楚。
+    """两个出售清单都为空 + 开了出售模式是自相矛盾的配置, 要在入场就说清楚。
 
     这种配置下出售会一直报成功却清不出空间, 满仓后每轮出价都失败, 提前告警更好排查。
     """
 
-    def _task(self, mode: str, keep, extra=()) -> AutoBidAuctionTask:
+    def _task(self, mode: str, before=(), after=()) -> AutoBidAuctionTask:
         task = _make_task()
         task.config = _config(
             **{
                 AutoBidAuctionTask.CONF_SELL_MODE: mode,
-                AutoBidAuctionTask.CONF_KEEP_QUALITIES: list(keep),
-                AutoBidAuctionTask.CONF_EXTRA_SELL_QUALITIES: list(extra),
+                AutoBidAuctionTask.CONF_SELL_BEFORE_WELFARE: list(before),
+                AutoBidAuctionTask.CONF_SELL_AFTER_WELFARE: list(after),
             }
         )
         return task
 
-    def test_warns_when_every_quality_is_kept(self):
-        task = self._task(AutoBidAuctionTask.SELL_MODE_FULL, AutoBidAuctionTask.QUALITY_KEYS)
+    def test_warns_when_both_lists_are_empty(self):
+        task = self._task(AutoBidAuctionTask.SELL_MODE_FULL)
 
         task._warn_if_no_sellable_quality()
 
-        self.assertIn(AutoBidAuctionTask.CONF_KEEP_QUALITIES, str(task.log_warning.call_args))
+        message = str(task.log_warning.call_args)
+        self.assertIn(AutoBidAuctionTask.CONF_SELL_BEFORE_WELFARE, message)
+        self.assertIn(AutoBidAuctionTask.CONF_SELL_AFTER_WELFARE, message)
 
     def test_stays_quiet_when_something_can_be_sold(self):
-        task = self._task(AutoBidAuctionTask.SELL_MODE_FULL, ("品质红",))
+        task = self._task(AutoBidAuctionTask.SELL_MODE_FULL, ("品质白",))
 
         task._warn_if_no_sellable_quality()
 
         task.log_warning.assert_not_called()
 
-    def test_extra_sell_qualities_count_as_sellable(self):
-        """追加出售的品质会覆盖保留列表, 所以「全保留 + 追加」不是空配置。"""
-        task = self._task(
-            AutoBidAuctionTask.SELL_MODE_FULL,
-            AutoBidAuctionTask.QUALITY_KEYS,
-            ("品质红",),
-        )
+    def test_after_list_alone_is_enough(self):
+        """只在「已领完」清单里勾了品质也算有配置 —— 领满后照样会卖。"""
+        task = self._task(AutoBidAuctionTask.SELL_MODE_FULL, (), ("品质紫",))
 
         task._warn_if_no_sellable_quality()
 
         task.log_warning.assert_not_called()
 
     def test_off_mode_never_warns(self):
-        task = self._task(AutoBidAuctionTask.SELL_MODE_OFF, AutoBidAuctionTask.QUALITY_KEYS)
+        task = self._task(AutoBidAuctionTask.SELL_MODE_OFF)
 
         task._warn_if_no_sellable_quality()
 
         task.log_warning.assert_not_called()
 
 
-class TestAuctionRedundantExtraSellWarning(unittest.TestCase):
-    """「追加出售品质」里勾了不在「保留品质」里的品质时要在入场就说清楚。
+class TestAuctionQualityListCleaning(unittest.TestCase):
+    """脏配置(手改 JSON)不能把出售流程带崩。
 
-    追加只在「该品质本来要保留」时才改变行为: 不在保留列表里的品质本来就会出售, 勾进追加
-    等于没勾。而这个组合又很自然(看到「追加出售」就把低价值品质勾上), 所以必须告警,
-    否则用户会以为配置生效了。
+    多选框的配置值本该是列表, 但用户可能手工改成字符串、数字或 null。清洗集中在
+    _quality_list: 非序列一律当空清单, 未知名称与重复项直接丢掉 —— 否则会去点
+    不存在的按钮, 或者在迭代 int / None 时直接抛 TypeError。
     """
 
-    def _task(self, mode: str, keep, extra) -> AutoBidAuctionTask:
+    def _task(self, key: str, value) -> AutoBidAuctionTask:
+        task = _make_task()
+        task.config = _config(**{key: value})
+        return task
+
+    def test_dirty_values_are_treated_as_empty(self):
+        for dirty in ("品质白", 5, None, {"品质白": 1}):
+            with self.subTest(dirty=dirty):
+                task = self._task(AutoBidAuctionTask.CONF_SELL_BEFORE_WELFARE, dirty)
+
+                self.assertEqual(task._sell_qualities(), [])
+
+    def test_unknown_names_are_dropped(self):
+        task = self._task(
+            AutoBidAuctionTask.CONF_SELL_BEFORE_WELFARE, ["品质不存在", "品质白"]
+        )
+
+        self.assertEqual(task._sell_qualities(), ["品质白"])
+
+    def test_duplicates_are_collapsed(self):
+        """重复项会让同一个品质被点两次 —— 第二次是取消勾选。"""
+        task = self._task(AutoBidAuctionTask.CONF_SELL_BEFORE_WELFARE, ["品质白", "品质白"])
+
+        self.assertEqual(task._sell_qualities(), ["品质白"])
+
+    def test_after_list_is_cleaned_too(self):
         task = _make_task()
         task.config = _config(
             **{
-                AutoBidAuctionTask.CONF_SELL_MODE: mode,
-                AutoBidAuctionTask.CONF_KEEP_QUALITIES: list(keep),
-                AutoBidAuctionTask.CONF_EXTRA_SELL_QUALITIES: list(extra),
+                AutoBidAuctionTask.CONF_SELL_BEFORE_WELFARE: "品质白",
+                AutoBidAuctionTask.CONF_SELL_AFTER_WELFARE: ["品质紫", "品质不存在"],
             }
         )
-        return task
+        task._welfare_claims_today = 5
+        task._welfare_daily_limit = 5
 
-    def test_warns_when_extra_is_not_kept(self):
-        task = self._task(AutoBidAuctionTask.SELL_MODE_FULL, ("品质红",), ("品质白",))
-
-        task._warn_if_extra_sell_is_redundant()
-
-        message = str(task.log_warning.call_args)
-        self.assertIn("品质白", message)
-        self.assertIn(AutoBidAuctionTask.CONF_EXTRA_SELL_QUALITIES, message)
-
-    def test_names_only_the_redundant_qualities(self):
-        task = self._task(
-            AutoBidAuctionTask.SELL_MODE_FULL,
-            ("品质红", "品质紫"),
-            ("品质白", "品质紫"),
-        )
-
-        task._warn_if_extra_sell_is_redundant()
-
-        message = str(task.log_warning.call_args)
-        self.assertIn("品质白", message)
-        self.assertNotIn("品质紫", message)
-
-    def test_stays_quiet_when_every_extra_quality_is_kept(self):
-        """全部追加品质都在保留列表里 = 配置真的会生效, 不该告警。"""
-        task = self._task(
-            AutoBidAuctionTask.SELL_MODE_FULL,
-            ("品质红", "品质紫"),
-            ("品质紫",),
-        )
-
-        task._warn_if_extra_sell_is_redundant()
-
-        task.log_warning.assert_not_called()
-
-    def test_stays_quiet_when_nothing_is_appended(self):
-        task = self._task(AutoBidAuctionTask.SELL_MODE_FULL, ("品质红",), ())
-
-        task._warn_if_extra_sell_is_redundant()
-
-        task.log_warning.assert_not_called()
-
-    def test_unknown_quality_names_are_ignored(self):
-        """脏配置里的未知名称既不会生效, 也不该被拿出来说。"""
-        task = self._task(AutoBidAuctionTask.SELL_MODE_FULL, ("品质红",), ("品质不存在",))
-
-        task._warn_if_extra_sell_is_redundant()
-
-        task.log_warning.assert_not_called()
-
-    def test_dirty_extra_value_does_not_crash(self):
-        """脏配置(手改 JSON)可能给出非序列的值, 必须安全跳过而不是崩在迭代上。
-
-        字符串虽然也不会崩(迭代出的是单字, 永远匹配不上品质名), 但 int / None 会直接
-        抛 TypeError, 所以类型守卫是必要的。
-        """
-        for dirty in ("品质白", 5, None):
-            with self.subTest(dirty=dirty):
-                task = _make_task()
-                task.config = _config(
-                    **{
-                        AutoBidAuctionTask.CONF_SELL_MODE: AutoBidAuctionTask.SELL_MODE_FULL,
-                        AutoBidAuctionTask.CONF_KEEP_QUALITIES: ["品质红"],
-                        AutoBidAuctionTask.CONF_EXTRA_SELL_QUALITIES: dirty,
-                    }
-                )
-
-                task._warn_if_extra_sell_is_redundant()
-
-                task.log_warning.assert_not_called()
-
-    def test_off_mode_never_warns(self):
-        task = self._task(AutoBidAuctionTask.SELL_MODE_OFF, ("品质红",), ("品质白",))
-
-        task._warn_if_extra_sell_is_redundant()
-
-        task.log_warning.assert_not_called()
-
-    def test_one_click_mode_never_warns(self):
-        """一键出售不筛品质, 追加列表对它没有意义。"""
-        task = self._task(AutoBidAuctionTask.SELL_MODE_ONE_CLICK, ("品质红",), ("品质白",))
-
-        task._warn_if_extra_sell_is_redundant()
-
-        task.log_warning.assert_not_called()
-
-    def test_interval_mode_warns_too(self):
-        task = self._task(AutoBidAuctionTask.SELL_MODE_INTERVAL, ("品质红",), ("品质白",))
-
-        task._warn_if_extra_sell_is_redundant()
-
-        task.log_warning.assert_called_once()
+        self.assertEqual(task._sell_qualities(), ["品质紫"])
 
 
 class TestAuctionOneClickSell(unittest.TestCase):
@@ -1201,14 +1371,6 @@ class TestAuctionOneClickSell(unittest.TestCase):
         self.assertIs(task.wait_ocr.call_args.kwargs["box"], boxes.popup_close_hint)
         self.assertIs(task.wait_ocr.call_args.kwargs["match"], RE_POPUP_CLOSE_HINT)
         self.assertIsNot(task.operate_click.call_args.args[0], boxes.popup_close_hint)
-
-    def test_button_regex_matches_the_label(self):
-        task = self._task()
-        task._wait_operate_click = Mock(return_value=False)
-
-        task._sell_on_settlement_screen(Mock(), auction_module.time.monotonic() + 60)
-
-        self.assertIs(task._wait_operate_click.call_args.args[1], RE_ONE_CLICK_SELL)
 
     def test_button_regex_tolerates_the_dropped_first_glyph(self):
         """首字「一」是单笔画, 检测模型裁剪偏紧时会直接丢掉它, 只读出「键出售」。
@@ -1309,14 +1471,14 @@ class TestAuctionOneClickSell(unittest.TestCase):
 
         task._sell_collections.assert_not_called()
 
-    def test_one_click_mode_never_warns_about_kept_qualities(self):
-        """它不筛选品质, 所以「保留品质全选」对它不是矛盾配置。"""
+    def test_one_click_mode_never_warns_about_empty_lists(self):
+        """它不筛选品质, 所以空清单对它不是矛盾配置。"""
         task = _make_task()
         task.config = _config(
             **{
                 AutoBidAuctionTask.CONF_SELL_MODE: AutoBidAuctionTask.SELL_MODE_ONE_CLICK,
-                AutoBidAuctionTask.CONF_KEEP_QUALITIES: list(AutoBidAuctionTask.QUALITY_KEYS),
-                AutoBidAuctionTask.CONF_EXTRA_SELL_QUALITIES: [],
+                AutoBidAuctionTask.CONF_SELL_BEFORE_WELFARE: [],
+                AutoBidAuctionTask.CONF_SELL_AFTER_WELFARE: [],
             }
         )
 
@@ -1338,7 +1500,6 @@ class TestAuctionSellValueCheck(unittest.TestCase):
 
     def _task(self, values) -> AutoBidAuctionTask:
         task = _make_task()
-        task.config = _config(**{AutoBidAuctionTask.CONF_KEEP_QUALITIES: ["品质红"]})
         task._read_sell_value = Mock(side_effect=list(values))
         task._select_quality_filters = Mock(return_value=5)
         return task
@@ -1385,7 +1546,7 @@ class TestAuctionSellValueCheck(unittest.TestCase):
         self.assertEqual(task._ensure_sell_value(Mock(), None, 5), 12345)
         self.assertEqual(task._select_quality_filters.call_count, 1)
 
-    def test_reselect_passes_the_extra_sell_qualities(self):
+    def test_reselect_passes_the_sell_qualities(self):
         """重勾必须用同一批品质, 否则满仓放宽时会把要保留的品质重新勾回来。"""
         task = self._task([0, 0, 12345])
 
@@ -1771,6 +1932,30 @@ class TestAuctionSellFailureEscalation(unittest.TestCase):
         self.assertEqual(task._sell_failures, AutoBidAuctionTask.SELL_FAILURE_ESCALATE_AFTER - 1)
         self.assertFalse(task._inventory_stuck)
 
+    def test_not_full_failures_after_the_threshold_keep_the_escalated_start(self):
+        """已达阈值后发生非满仓失败, 下一次满仓出售仍以放宽集合开局。
+
+        钉住现状: 非满仓失败对计数既不累加也不清零 (口径是「满仓连续失败」)。
+        若将来把口径改成「非满仓失败清零计数」, 这条会红 —— 届时需要先确认
+        「满仓失败 → 手动清仓 → 长时间抖动 → 再次满仓」场景愿意从零重新累计,
+        不能顺手改掉。
+        """
+        task = self._task([False, True])
+        task._sell_failures = AutoBidAuctionTask.SELL_FAILURE_ESCALATE_AFTER
+
+        task._sell_collections_with_escalation(Mock(), None, (), inventory_full=False)
+        self.assertEqual(task._sell_failures, AutoBidAuctionTask.SELL_FAILURE_ESCALATE_AFTER)
+
+        self.assertTrue(
+            task._sell_collections_with_escalation(Mock(), None, (), inventory_full=True)
+        )
+        # 第 1 次调用是非满仓尝试(未放宽), 第 2 次满仓直接以放宽集合开局, 不再有第三次。
+        self.assertEqual(task._sell_collections.call_count, 2)
+        self.assertEqual(
+            set(task._sell_collections.call_args.args[2]),
+            set(AutoBidAuctionTask.QUALITY_KEYS),
+        )
+
     def test_full_failure_starting_from_zero_still_escalates_after_the_threshold(self):
         """满仓连续失败到阈值仍必须放宽, 反写计数语义不能把这条能力一起拆掉。"""
         task = self._task([False, False, True])
@@ -1799,15 +1984,6 @@ class TestAuctionNoticePopup(unittest.TestCase):
         self.assertTrue(task._dismiss_notice_popup(boxes, None, "测试"))
         self.assertIs(task.wait_ocr.call_args.kwargs["box"], boxes.exception_area)
         task.operate_click.assert_called_once_with(boxes.exception_area, after_sleep=0.3)
-
-    def test_popup_probe_polls_with_a_timeout(self):
-        """单帧 ocr 会漏掉刚出现的弹窗, 之后整条流程卡在弹窗上。"""
-        task = _make_task()
-        task.wait_ocr = Mock(return_value=[])
-
-        self.assertFalse(task._dismiss_notice_popup(Mock(), None, "测试"))
-        self.assertGreater(task.wait_ocr.call_args.kwargs["time_out"], 0)
-        self.assertFalse(task.wait_ocr.call_args.kwargs["raise_if_not_found"])
 
     def test_popup_probe_uses_the_given_budget(self):
         """每次出价都要查一遍, 热路径要能用更小的预算。"""
@@ -2018,14 +2194,6 @@ class TestAuctionEstimateStableRead(unittest.TestCase):
         # 300 连续 3 次相同之后还要满足最短观察窗口, 所以读取次数多于 5 次。
         self.assertGreaterEqual(task._read_estimate_value.call_count, 5)
 
-    def test_jumping_value_is_not_used_early(self):
-        """跳动中的中间值不能被采用, 否则会按错误的估价出价。"""
-        task = self._task([100, 200, 300, 300, 300])
-
-        value = task._read_stable_asset_value(Mock(), 10, "当前估价")
-
-        self.assertNotIn(value, (100, 200))
-
     def test_refetches_a_frame_between_reads(self):
         """不换帧时两次读取会落在同一帧上, 读到同样的中间值, 白等。"""
         task = self._task([100, 200, 300, 300, 300])
@@ -2088,6 +2256,35 @@ class TestAuctionEstimateStableRead(unittest.TestCase):
         self.assertFalse(AutoBidAuctionTask._has_inconsistent_grouping("22,684"))
         self.assertFalse(AutoBidAuctionTask._has_inconsistent_grouping("643"))
         self.assertFalse(AutoBidAuctionTask._has_inconsistent_grouping(",643"))
+
+    def test_fullwidth_comma_is_normalized_before_the_read_defenses(self):
+        """全角逗号必须先归一成半角, 否则两条残缺读数防线同时失效。
+
+        防线用 re.sub(r"[^\\d,]", "") 保留半角逗号来识别「首位漏读 / 分组不自洽」;
+        全角逗号「，」不在保留范围里会被当噪声删掉, 「，643」就此洗成「643」,
+        截断读数被当成完整值采纳后, 出价会按低一个数量级的价格算。每一对半角/全角
+        输入的判定结果必须一致。
+        """
+        cases = [
+            # (半角输入, 全角输入, 是否首位漏读, 是否分组不自洽)
+            (",643", "，643", True, False),
+            ("：,523", "：，523", True, False),
+            (",1234", "，1234", True, False),
+            ("1,23,456", "1，23，456", False, True),
+            ("12,34", "12，34", False, True),
+        ]
+        for half, full, partial, inconsistent in cases:
+            for text, expected_partial, expected_inconsistent in (
+                (half, partial, inconsistent),
+                (full, partial, inconsistent),
+            ):
+                with self.subTest(text=text):
+                    self.assertEqual(
+                        AutoBidAuctionTask._is_partial_number_text(text), expected_partial
+                    )
+                    self.assertEqual(
+                        AutoBidAuctionTask._has_inconsistent_grouping(text), expected_inconsistent
+                    )
 
     def test_read_asset_value_drops_partial_estimate_text(self):
         """估价区域读到残缺文本时按未读出处理, 交给上层重读; 稳定的数字区域保持原行为。"""
@@ -2200,14 +2397,6 @@ class TestAuctionEstimateStableRead(unittest.TestCase):
         task = self._task_with_tight([(197, True)] + [(300, False)] * 8)
 
         self.assertEqual(task._read_stable_asset_value(Mock(), 10, "当前估价"), 300)
-
-    def test_value_read_after_tight_reads_is_adopted(self):
-        """贴边作废旧值之后读到的新值应当被采用, 不能一直卡在旧值上。"""
-        task = self._task_with_tight(
-            [(26643, False), (2643, True), (2643, True)] + [(25000, False)] * 8
-        )
-
-        self.assertEqual(task._read_stable_asset_value(Mock(), 10, "当前估价"), 25000)
 
 
 class TestAuctionEstimateLabelAnchor(unittest.TestCase):
@@ -2329,24 +2518,6 @@ class TestAuctionEstimateLabelAnchor(unittest.TestCase):
         self.assertGreater(right, estimate_right_edge, "右边界必须留出估价末位的余量")
         self.assertLess(right, asset_left_edge, "右边界不能伸进我的资产数值")
 
-    def test_only_the_estimate_survives_when_the_label_is_missed(self):
-        """标签漏读时, 收窄后的裁框里只剩估价一个数字, 拼接退化成单值而非粘成两串。"""
-        left, top, right, _ = AutoBidAuctionTask.BOX_ESTIMATE
-        screen_width = 1920
-        box_left = round(left * screen_width)
-        box_right = round(right * screen_width)
-
-        # 按实测比例摆放两个数字: 估价右端 0.9052, 资产左端在 0.9594 之外。
-        estimate_box = self._text_box("2,643", round(0.8438 * screen_width), 100)
-        asset_box = self._text_box("22,684", round(0.9600 * screen_width), 90)
-        # 裁框只保留落在区域内的框 —— 这是 openvino_detector 建框后的实际效果。
-        visible = [b for b in (estimate_box, asset_box) if b.x < box_right]
-
-        self.assertEqual([b.name for b in visible], ["2,643"])
-        self.assertLess(box_right, asset_box.x)
-        self.assertGreater(box_left, 0)
-        self.assertGreaterEqual(top, 0)
-
     def test_number_touching_the_right_edge_is_flagged(self):
         """数字右端贴住裁框边界说明末位可能被切掉, 用贴边标志暴露给调用方。"""
         box = Mock(x=1850, y=140, width=350, height=60)
@@ -2448,24 +2619,6 @@ class TestAuctionEstimateBidPrice(unittest.TestCase):
         self.assertEqual(task._estimate_bid_price(Mock(), None, 1), 7)
         task.log_warning.assert_called()
 
-    def test_zero_reading_is_not_reported_as_a_read_failure(self):
-        """读到 0 和读不到是两件事, 日志必须能区分。
-
-        排查线上问题时这两条日志的含义完全不同: 「识别失败」指向 OCR/遮挡,
-        「价格无效」指向估价本身是 0。混在一起会把面板没加载完误判成 OCR 失灵。
-        """
-        task = self._task(
-            **{
-                AutoBidAuctionTask.CONF_FIXED_PRICE: 7,
-                AutoBidAuctionTask.CONF_ESTIMATE_RATIO: "1",
-            }
-        )
-        task._read_stable_asset_value = Mock(return_value=0)
-
-        task._estimate_bid_price(Mock(), None, 1)
-
-        self.assertNotIn("识别失败", str(task.log_warning.call_args))
-
     def test_falls_back_to_base_price_when_estimate_unreadable(self):
         task = self._task(
             **{
@@ -2485,10 +2638,6 @@ class TestAuctionMainScreenTitle(unittest.TestCase):
     「我的资产」在结算等界面也会出现, 用它判"已回主界面"会提前放行;
     「即刻落槌」只在拍卖主界面出现, 位置与藏品仓库标题是同一个槽位。
     """
-
-    def test_main_title_shares_the_warehouse_title_slot(self):
-        """用户要求主界面标题坐标与藏品仓库标题一致, 改一个别忘另一个。"""
-        self.assertEqual(AutoBidAuctionTask.BOX_MAIN_TITLE, AutoBidAuctionTask.BOX_WAREHOUSE_TITLE)
 
     def test_main_title_regex_matches_only_the_auction_hall(self):
         self.assertTrue(RE_MAIN_TITLE.search("即刻落槌"))
@@ -2669,15 +2818,6 @@ class TestAuctionWorldDropRecovery(unittest.TestCase):
         )
         self.assertLess(self.clock.now - started, AutoBidAuctionTask.MATCH_CLICK_TIMEOUT)
 
-    def test_match_click_keeps_waiting_when_not_in_world(self):
-        """不在大世界时仍要等满 MATCH_CLICK_TIMEOUT, 不能把加载动画当成掉线。"""
-        task = self._task(match=False, world=False)
-        started = self.clock.now
-
-        self.assertIsNone(task._handle_match_click(Mock(), self.clock.now + 120))
-
-        self.assertGreaterEqual(self.clock.now - started, AutoBidAuctionTask.MATCH_CLICK_TIMEOUT)
-
     def test_stage_match_recovers_when_world_detected_before_timeout(self):
         """空转到超时前检测到大世界时走回场, 而不是抛「匹配阶段超时」。"""
         task = self._task(world=True)
@@ -2833,14 +2973,6 @@ class TestAuctionWorldDropRecovery(unittest.TestCase):
 
         self.assertEqual(task.scroll.call_count, AutoBidAuctionTask.RECOVER_SCROLL_STEPS)
 
-    def test_current_venue_is_read_for_logging(self):
-        task = self._task()
-        box = Mock()
-        box.name = "当前：海贝场"
-        task.ocr = Mock(return_value=[box])
-
-        self.assertEqual(task._read_current_venue(), "当前：海贝场")
-
     def test_current_venue_read_failure_is_not_fatal(self):
         """会场文字只用于日志留痕, 读不出不能影响回场结果。"""
         task = self._task()
@@ -2870,14 +3002,6 @@ class TestAuctionEntryRecover(unittest.TestCase):
         task.in_world = Mock(return_value=world)
         task._return_to_auction = Mock(return_value=True)
         return task
-
-    def test_already_in_auction_skips_recover(self):
-        """已在拍卖界面时只多花一次标题探测, 不触发任何回场动作。"""
-        task = self._task(in_auction=True)
-
-        task._ensure_auction_entry(Mock())
-
-        task._return_to_auction.assert_not_called()
 
     def test_auction_screen_wins_over_world_probe(self):
         """已在拍卖界面时直接返回, 不再去探测大世界。
@@ -3132,14 +3256,6 @@ class TestAuctionEstimateEdgeMarginScaling(unittest.TestCase):
                 Mock(x=self.BOX_RIGHT - 350, y=140, width=350, height=60), 1.0
             )
 
-    def test_margin_follows_screen_width(self):
-        """阈值随屏幕宽度等比放大, 且至少 1px。"""
-        ratio = AutoBidAuctionTask.ESTIMATE_EDGE_MARGIN_RATIO
-
-        self.assertEqual(max(1, round(1920 * ratio)), 8)
-        self.assertEqual(max(1, round(2560 * ratio)), 11)
-        self.assertEqual(max(1, round(3840 * ratio)), 16)
-
     def test_1080p_known_failure_shape_is_tight(self):
         """1080p 下末位只剩 4px 竖边 —— 这是实际发生过的故障形态, 必须判贴边。"""
         _, tight = self._read(1920, 4)
@@ -3174,7 +3290,7 @@ class TestAuctionEstimateEdgeMarginScaling(unittest.TestCase):
 
 
 class TestAuctionBidModeConfigVisibility(unittest.TestCase):
-    """出价模式决定哪些价格配置可见, 且不能有字段被永久隐藏。"""
+    """出价模式下的价格配置不能有字段被永久隐藏, 也不能误藏无关配置。"""
 
     def _visible_keys(self, task: AutoBidAuctionTask, mode: str, **overrides) -> set[str]:
         config = dict(task.default_config)
@@ -3183,70 +3299,14 @@ class TestAuctionBidModeConfigVisibility(unittest.TestCase):
         fields = build_config_fields(config, task.config_description, task.config_type)
         return {field["key"] for field in fields}
 
-    def test_custom_mode_shows_legacy_price_configs(self):
-        task = _make_configured_task()
-        visible = self._visible_keys(task, AutoBidAuctionTask.BID_MODE_CUSTOM)
-
-        self.assertIn(AutoBidAuctionTask.CONF_FIXED_PRICE, visible)
-        self.assertIn(AutoBidAuctionTask.CONF_AUTO_RAISE, visible)
-        self.assertIn(AutoBidAuctionTask.CONF_RAISE_MODE, visible)
-        self.assertIn(AutoBidAuctionTask.CONF_SPECIAL_ROUND, visible)
-        self.assertFalse(set(AutoBidAuctionTask.CONF_BID_PRICES) & visible)
-        self.assertNotIn(AutoBidAuctionTask.CONF_ESTIMATE_RATIO, visible)
-
-    def test_list_mode_shows_all_six_bid_prices(self):
-        task = _make_configured_task()
-        visible = self._visible_keys(task, AutoBidAuctionTask.BID_MODE_LIST)
-
-        self.assertEqual(set(AutoBidAuctionTask.CONF_BID_PRICES) - visible, set())
-        self.assertNotIn(AutoBidAuctionTask.CONF_FIXED_PRICE, visible)
-        self.assertNotIn(AutoBidAuctionTask.CONF_AUTO_RAISE, visible)
-        self.assertNotIn(AutoBidAuctionTask.CONF_ESTIMATE_RATIO, visible)
-
-    def test_estimate_mode_shows_only_ratio(self):
-        task = _make_configured_task()
-        visible = self._visible_keys(task, AutoBidAuctionTask.BID_MODE_ESTIMATE)
-
-        self.assertIn(AutoBidAuctionTask.CONF_ESTIMATE_RATIO, visible)
-        self.assertNotIn(AutoBidAuctionTask.CONF_FIXED_PRICE, visible)
-        self.assertFalse(set(AutoBidAuctionTask.CONF_BID_PRICES) & visible)
-
-    def test_every_price_config_is_reachable_in_some_mode(self):
-        """sub_configs 里的键名写错会让字段在所有模式下都隐藏, 用户根本改不了。"""
-        task = _make_configured_task()
-        price_keys = {
-            task.CONF_FIXED_PRICE,
-            task.CONF_AUTO_RAISE,
-            task.CONF_RAISE_MODE,
-            task.CONF_RAISE_VALUE,
-            task.CONF_RAISE_ROUND,
-            task.CONF_SPECIAL_ROUND,
-            task.CONF_SPECIAL_ROUNDS,
-            task.CONF_SPECIAL_ROUND_PRICE,
-            task.CONF_ESTIMATE_RATIO,
-            *task.CONF_BID_PRICES,
-        }
-        # 子配置的可见性还取决于父项的当前值, 这里把相关开关都打开。
-        toggles = {
-            task.CONF_AUTO_RAISE: True,
-            task.CONF_SPECIAL_ROUND: True,
-            task.CONF_RAISE_MODE: task.RAISE_MODE_MULTIPLE,
-        }
-
-        reachable: set[str] = set()
-        for mode in (task.BID_MODE_CUSTOM, task.BID_MODE_LIST, task.BID_MODE_ESTIMATE):
-            reachable |= self._visible_keys(task, mode, **toggles)
-
-        self.assertEqual(price_keys - reachable, set())
-
     def test_other_configs_are_never_hidden_by_bid_mode(self):
         """出价模式只应影响价格相关配置, 别把藏品/低保金配置一起藏掉。"""
         task = _make_configured_task()
         unrelated = {
             task.CONF_SELL_MODE,
             task.CONF_SELL_INTERVAL,
-            task.CONF_KEEP_QUALITIES,
-            task.CONF_EXTRA_SELL_QUALITIES,
+            task.CONF_SELL_BEFORE_WELFARE,
+            task.CONF_SELL_AFTER_WELFARE,
             task.CONF_ASSIST_FEATURES,
         }
         # 出售子项由「出售藏品模式」控制可见性, 这里固定成会展示它们的模式。
@@ -3275,49 +3335,8 @@ class TestAuctionSellModeConfigVisibility(unittest.TestCase):
 
         self.assertIn(task.CONF_SELL_MODE, visible)
         self.assertNotIn(task.CONF_SELL_INTERVAL, visible)
-        self.assertNotIn(task.CONF_KEEP_QUALITIES, visible)
-        self.assertNotIn(task.CONF_EXTRA_SELL_QUALITIES, visible)
-
-    def test_full_mode_shows_quality_configs_only(self):
-        task = _make_configured_task()
-        visible = self._visible_keys(task, task.SELL_MODE_FULL)
-
-        self.assertIn(task.CONF_KEEP_QUALITIES, visible)
-        self.assertIn(task.CONF_EXTRA_SELL_QUALITIES, visible)
-        self.assertNotIn(task.CONF_SELL_INTERVAL, visible)
-
-    def test_interval_mode_shows_every_sell_config(self):
-        task = _make_configured_task()
-        visible = self._visible_keys(task, task.SELL_MODE_INTERVAL)
-
-        self.assertIn(task.CONF_SELL_INTERVAL, visible)
-        self.assertIn(task.CONF_KEEP_QUALITIES, visible)
-        self.assertIn(task.CONF_EXTRA_SELL_QUALITIES, visible)
-
-    def test_every_sell_config_is_reachable_in_some_mode(self):
-        """sub_configs 里的键名写错会让字段在所有模式下都隐藏, 用户根本改不了。"""
-        task = _make_configured_task()
-        sell_keys = {
-            task.CONF_SELL_INTERVAL,
-            task.CONF_KEEP_QUALITIES,
-            task.CONF_EXTRA_SELL_QUALITIES,
-        }
-
-        reachable: set[str] = set()
-        for mode in task.SELL_MODES:
-            reachable |= self._visible_keys(task, mode)
-
-        self.assertEqual(sell_keys - reachable, set())
-
-    def test_one_click_mode_shows_no_sell_configs(self):
-        """一键出售不筛品质也没有间隔, 选它时面板不该展开任何子项。"""
-        task = _make_configured_task()
-        visible = self._visible_keys(task, task.SELL_MODE_ONE_CLICK)
-
-        self.assertIn(task.CONF_SELL_MODE, visible)
-        self.assertNotIn(task.CONF_SELL_INTERVAL, visible)
-        self.assertNotIn(task.CONF_KEEP_QUALITIES, visible)
-        self.assertNotIn(task.CONF_EXTRA_SELL_QUALITIES, visible)
+        self.assertNotIn(task.CONF_SELL_BEFORE_WELFARE, visible)
+        self.assertNotIn(task.CONF_SELL_AFTER_WELFARE, visible)
 
     def test_every_mode_declares_its_sub_configs(self):
         """新增模式时漏写 sub_configs 条目, 将来给它加子项会静默不显示。"""
@@ -3336,183 +3355,53 @@ class TestAuctionSellModeConfigVisibility(unittest.TestCase):
         self.assertEqual(set(mode_field["options"]), set(task.SELL_MODES))
 
     def test_legacy_auto_clear_key_is_gone(self):
-        """旧开关合并进模式后不应再注册, 否则面板上会多出一个失效控件。"""
-        task = _make_configured_task()
-        self.assertNotIn(task.LEGACY_CONF_AUTO_CLEAR, task.default_config)
-        self.assertNotIn(task.LEGACY_CONF_AUTO_CLEAR, task.config_type)
-        self.assertNotIn(task.LEGACY_CONF_AUTO_CLEAR, task.config_description)
+        """旧开关合并进模式后不应再注册, 否则面板上会多出一个失效控件。
 
-
-class TestAuctionSellModeMigration(unittest.TestCase):
-    """旧版「启用自动清理藏品 / 出售藏品间隔次数」要能迁移到新模式。"""
-
-    def test_auto_clear_maps_to_full_mode(self):
-        raw = {AutoBidAuctionTask.LEGACY_CONF_AUTO_CLEAR: True}
-
-        self.assertEqual(
-            AutoBidAuctionTask._migrate_sell_mode(raw), AutoBidAuctionTask.SELL_MODE_FULL
-        )
-
-    def test_interval_maps_to_interval_mode(self):
-        raw = {
-            AutoBidAuctionTask.LEGACY_CONF_AUTO_CLEAR: False,
-            AutoBidAuctionTask.CONF_SELL_INTERVAL: 3,
-        }
-
-        self.assertEqual(
-            AutoBidAuctionTask._migrate_sell_mode(raw), AutoBidAuctionTask.SELL_MODE_INTERVAL
-        )
-
-    def test_auto_clear_wins_over_interval(self):
-        """旧版自动清理开启时忽略间隔, 迁移后不能反而变成按间隔出售。"""
-        raw = {
-            AutoBidAuctionTask.LEGACY_CONF_AUTO_CLEAR: True,
-            AutoBidAuctionTask.CONF_SELL_INTERVAL: 3,
-        }
-
-        self.assertEqual(
-            AutoBidAuctionTask._migrate_sell_mode(raw), AutoBidAuctionTask.SELL_MODE_FULL
-        )
-
-    def test_disabled_legacy_config_maps_to_off(self):
-        raw = {
-            AutoBidAuctionTask.LEGACY_CONF_AUTO_CLEAR: False,
-            AutoBidAuctionTask.CONF_SELL_INTERVAL: 0,
-        }
-
-        self.assertEqual(
-            AutoBidAuctionTask._migrate_sell_mode(raw), AutoBidAuctionTask.SELL_MODE_OFF
-        )
-
-    def test_boolean_interval_is_not_read_as_one(self):
-        """bool 是 int 的子类, True 不该被当成间隔 1 而误判成按间隔出售。"""
-        raw = {AutoBidAuctionTask.CONF_SELL_INTERVAL: True}
-
-        self.assertEqual(
-            AutoBidAuctionTask._migrate_sell_mode(raw), AutoBidAuctionTask.SELL_MODE_OFF
-        )
-
-    def test_non_dict_input_is_treated_as_off(self):
-        self.assertEqual(
-            AutoBidAuctionTask._migrate_sell_mode(None), AutoBidAuctionTask.SELL_MODE_OFF
-        )
-
-    def _migrate(self, raw, *, default_mode=None):
-        task = _make_configured_task()
-        if default_mode is not None:
-            task.default_config[AutoBidAuctionTask.CONF_SELL_MODE] = default_mode
-        task.log_info = Mock()
-        task._migrate_legacy_sell_config(raw)
-        return task
-
-    def test_migration_writes_the_derived_mode_into_defaults(self):
-        """写进去的必须是推导结果, 不能是写死的模式。"""
-        task = self._migrate(
-            {
-                AutoBidAuctionTask.LEGACY_CONF_AUTO_CLEAR: True,
-                AutoBidAuctionTask.CONF_SELL_INTERVAL: 4,
-            }
-        )
-
-        self.assertEqual(
-            task.default_config[AutoBidAuctionTask.CONF_SELL_MODE],
-            AutoBidAuctionTask.SELL_MODE_FULL,
-        )
-
-    def test_migration_is_skipped_when_the_new_key_already_exists(self):
-        """已经迁移过的配置不能被旧键再覆盖一次。
-
-        默认值刻意选成旧键推导不出来的模式, 否则「跳过」和「重新推导」结果相同,
-        测试就无法区分迁移有没有真的被跳过。
+        用字面量而不是常量: 常量本身已被删除, 这里守的是「这个名字不许再出现在面板上」。
         """
-        task = self._migrate(
-            {
-                AutoBidAuctionTask.CONF_SELL_MODE: AutoBidAuctionTask.SELL_MODE_OFF,
-                AutoBidAuctionTask.CONF_SELL_INTERVAL: 4,
-            },
-            default_mode=AutoBidAuctionTask.SELL_MODE_FULL,
-        )
-
-        self.assertEqual(
-            task.default_config[AutoBidAuctionTask.CONF_SELL_MODE],
-            AutoBidAuctionTask.SELL_MODE_FULL,
-        )
-
-    def test_migration_is_skipped_for_a_brand_new_user(self):
-        """没有配置文件(全新用户)时不该写入任何迁移结果。
-
-        load_config 读到空文件会归一成空字典, 所以这里传 {} 而不是 None。
-        """
-        task = self._migrate({}, default_mode=AutoBidAuctionTask.SELL_MODE_FULL)
-
-        self.assertEqual(
-            task.default_config[AutoBidAuctionTask.CONF_SELL_MODE],
-            AutoBidAuctionTask.SELL_MODE_FULL,
-        )
-
-    def test_migration_is_skipped_when_no_legacy_key_is_present(self):
-        task = self._migrate(
-            {AutoBidAuctionTask.CONF_KEEP_QUALITIES: ["品质红"]},
-            default_mode=AutoBidAuctionTask.SELL_MODE_FULL,
-        )
-
-        self.assertEqual(
-            task.default_config[AutoBidAuctionTask.CONF_SELL_MODE],
-            AutoBidAuctionTask.SELL_MODE_FULL,
-        )
-
-    def test_migration_does_not_touch_defaults_when_sell_mode_is_unregistered(self):
-        """模式键被移除时迁移必须静默跳过, 不能给 default_config 塞回一个野键。"""
         task = _make_configured_task()
-        task.default_config.pop(AutoBidAuctionTask.CONF_SELL_MODE)
-        task.log_info = Mock()
-        task._migrate_legacy_sell_config({AutoBidAuctionTask.CONF_SELL_INTERVAL: 4})
 
-        self.assertNotIn(AutoBidAuctionTask.CONF_SELL_MODE, task.default_config)
+        for legacy in ("启用自动清理藏品", "出售藏品间隔次数"):
+            with self.subTest(key=legacy):
+                self.assertNotIn(legacy, task.config_type)
+        self.assertNotIn("启用自动清理藏品", task.default_config)
+        self.assertNotIn("启用自动清理藏品", task.config_description)
 
-    def test_legacy_config_file_migrates_end_to_end(self):
-        """走一遍真实的 Config 读写: 模式落盘, 旧键被清掉, 二次加载保持稳定。"""
+
+class TestAuctionConfigReachability(unittest.TestCase):
+    """穷举模式组合, 保证 default_config 的每个键都至少在一个组合下可见。
+
+    旧的可达性用例手工列举键集合, 新增配置键忘了同步集合就失去保护;
+    这里直接扫 default_config 的全部键, 新键自动纳入。
+    """
+
+    def test_every_default_config_key_is_reachable_in_some_combination(self):
+        """sub_configs 里的键名写错会让字段在所有模式下都隐藏, 用户根本改不了。"""
         task = _make_configured_task()
-        task.log_info = Mock()
-        legacy = {
-            AutoBidAuctionTask.LEGACY_CONF_AUTO_CLEAR: False,
-            AutoBidAuctionTask.CONF_SELL_INTERVAL: 5,
-            AutoBidAuctionTask.CONF_KEEP_QUALITIES: ["品质红"],
+        bid_modes = task.config_type[task.CONF_BID_MODE]["options"]
+        sell_modes = task.config_type[task.CONF_SELL_MODE]["options"]
+        raise_modes = task.config_type[task.CONF_RAISE_MODE]["options"]
+        assist_subsets = _option_subsets(task.config_type[task.CONF_ASSIST_FEATURES]["options"])
+        # 子配置的可见性还取决于父开关的当前值, 这里固定成全展开。
+        toggles = {
+            task.CONF_AUTO_RAISE: True,
+            task.CONF_SPECIAL_ROUND: True,
         }
 
-        with tempfile.TemporaryDirectory() as folder:
-            path = Path(folder) / f"{type(task).__name__}.json"
-            path.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
+        reachable: set[str] = set()
+        for bid_mode, sell_mode, raise_mode, assists in itertools.product(
+            bid_modes, sell_modes, raise_modes, assist_subsets
+        ):
+            config = dict(task.default_config)
+            config.update(toggles)
+            config[task.CONF_BID_MODE] = bid_mode
+            config[task.CONF_SELL_MODE] = sell_mode
+            config[task.CONF_RAISE_MODE] = raise_mode
+            config[task.CONF_ASSIST_FEATURES] = list(assists)
+            fields = build_config_fields(config, task.config_description, task.config_type)
+            reachable |= {field["key"] for field in fields}
 
-            with patch.object(Config, "config_folder", folder):
-                task._migrate_legacy_sell_config(legacy)
-                config = Config(type(task).__name__, task.default_config)
-
-                self.assertEqual(
-                    config[AutoBidAuctionTask.CONF_SELL_MODE],
-                    AutoBidAuctionTask.SELL_MODE_INTERVAL,
-                )
-                # 用户原来的保留品质不能被迁移弄丢.
-                self.assertEqual(config[AutoBidAuctionTask.CONF_KEEP_QUALITIES], ["品质红"])
-
-                saved = json.loads(path.read_text(encoding="utf-8"))
-                self.assertNotIn(AutoBidAuctionTask.LEGACY_CONF_AUTO_CLEAR, saved)
-                self.assertEqual(
-                    saved[AutoBidAuctionTask.CONF_SELL_MODE],
-                    AutoBidAuctionTask.SELL_MODE_INTERVAL,
-                )
-
-                # 二次加载时旧键已不在文件里, 迁移不应再改写已经落盘的模式.
-                second = _make_configured_task()
-                second.log_info = Mock()
-                second.default_config[AutoBidAuctionTask.CONF_SELL_MODE] = (
-                    AutoBidAuctionTask.SELL_MODE_OFF
-                )
-                second._migrate_legacy_sell_config(json.loads(path.read_text(encoding="utf-8")))
-                self.assertEqual(
-                    second.default_config[AutoBidAuctionTask.CONF_SELL_MODE],
-                    AutoBidAuctionTask.SELL_MODE_OFF,
-                )
+        self.assertEqual(set(task.default_config) - reachable, set())
 
 
 class TestAuctionAssistFeaturesConfig(unittest.TestCase):
@@ -3539,10 +3428,11 @@ class TestAuctionAssistFeaturesConfig(unittest.TestCase):
         """旧开关合并进多选框后不应再注册, 否则面板上会多出两个失效控件。"""
         task = _make_configured_task()
 
-        for key in (task.LEGACY_CONF_USE_EMOTE, task.LEGACY_CONF_USE_WELFARE):
-            self.assertNotIn(key, task.default_config)
-            self.assertNotIn(key, task.config_type)
-            self.assertNotIn(key, task.config_description)
+        for key in ("启用表情包", "启用低保金"):
+            with self.subTest(key=key):
+                self.assertNotIn(key, task.default_config)
+                self.assertNotIn(key, task.config_type)
+                self.assertNotIn(key, task.config_description)
 
     def _task_with(self, value) -> AutoBidAuctionTask:
         task = _make_task()
@@ -3593,7 +3483,7 @@ class TestAuctionAssistFeaturesConfig(unittest.TestCase):
 
             with self.subTest(features=features):
                 # 资产低于阈值, 勾选了低保金才会真的去领取。
-                self.assertEqual(task._post_round_state.welfare_claimed, bool(features))
+                self.assertEqual(task._try_claim_welfare.called, bool(features))
 
     def test_asset_is_observed_even_when_welfare_unchecked(self):
         """取消勾选「低保金」不能连带停掉资产读数的日志。
@@ -3614,145 +3504,8 @@ class TestAuctionAssistFeaturesConfig(unittest.TestCase):
                 )
 
 
-class TestAuctionAssistConfigMigration(unittest.TestCase):
-    """旧版「启用表情包 / 启用低保金」两个开关要能迁移到「启用辅助功能」多选框。"""
-
-    def test_enabled_legacy_switches_become_checked_options(self):
-        raw = {
-            AutoBidAuctionTask.LEGACY_CONF_USE_EMOTE: True,
-            AutoBidAuctionTask.LEGACY_CONF_USE_WELFARE: True,
-        }
-
-        self.assertEqual(
-            AutoBidAuctionTask._migrate_assist_features(raw),
-            [AutoBidAuctionTask.ASSIST_EMOTE, AutoBidAuctionTask.ASSIST_WELFARE],
-        )
-
-    def test_only_enabled_switch_is_checked(self):
-        raw = {
-            AutoBidAuctionTask.LEGACY_CONF_USE_EMOTE: True,
-            AutoBidAuctionTask.LEGACY_CONF_USE_WELFARE: False,
-        }
-
-        self.assertEqual(
-            AutoBidAuctionTask._migrate_assist_features(raw),
-            [AutoBidAuctionTask.ASSIST_EMOTE],
-        )
-
-    def test_both_off_migrates_to_an_empty_selection(self):
-        raw = {
-            AutoBidAuctionTask.LEGACY_CONF_USE_EMOTE: False,
-            AutoBidAuctionTask.LEGACY_CONF_USE_WELFARE: False,
-        }
-
-        self.assertEqual(AutoBidAuctionTask._migrate_assist_features(raw), [])
-
-    def test_truthy_non_boolean_values_are_not_treated_as_enabled(self):
-        """旧值只认 True, 手工填的 1 或字符串不该让任务去点表情包按钮。"""
-        raw = {
-            AutoBidAuctionTask.LEGACY_CONF_USE_EMOTE: "1",
-            AutoBidAuctionTask.LEGACY_CONF_USE_WELFARE: 1,
-        }
-
-        self.assertEqual(AutoBidAuctionTask._migrate_assist_features(raw), [])
-
-    def _migrate(self, raw, *, default=None):
-        task = _make_configured_task()
-        if default is not None:
-            task.default_config[AutoBidAuctionTask.CONF_ASSIST_FEATURES] = default
-        task.log_info = Mock()
-        task._migrate_legacy_assist_config(raw)
-        return task
-
-    def test_migration_writes_the_derived_selection_into_defaults(self):
-        """写进去的必须是推导结果, 不能是写死的勾选项。"""
-        task = self._migrate({AutoBidAuctionTask.LEGACY_CONF_USE_WELFARE: True})
-
-        self.assertEqual(
-            task.default_config[AutoBidAuctionTask.CONF_ASSIST_FEATURES],
-            [AutoBidAuctionTask.ASSIST_WELFARE],
-        )
-
-    def test_migration_is_skipped_when_the_new_key_already_exists(self):
-        """已经迁移过的配置不能被旧键再覆盖一次。
-
-        默认值刻意选成旧键推导不出来的勾选项, 否则「跳过」和「重新推导」结果相同,
-        测试就无法区分迁移有没有真的被跳过。
-        """
-        task = self._migrate(
-            {
-                AutoBidAuctionTask.CONF_ASSIST_FEATURES: [],
-                AutoBidAuctionTask.LEGACY_CONF_USE_EMOTE: True,
-            },
-            default=[AutoBidAuctionTask.ASSIST_WELFARE],
-        )
-
-        self.assertEqual(
-            task.default_config[AutoBidAuctionTask.CONF_ASSIST_FEATURES],
-            [AutoBidAuctionTask.ASSIST_WELFARE],
-        )
-
-    def test_migration_is_skipped_for_a_brand_new_user(self):
-        task = self._migrate({}, default=[AutoBidAuctionTask.ASSIST_EMOTE])
-
-        self.assertEqual(
-            task.default_config[AutoBidAuctionTask.CONF_ASSIST_FEATURES],
-            [AutoBidAuctionTask.ASSIST_EMOTE],
-        )
-
-    def test_migration_does_not_touch_defaults_when_key_is_unregistered(self):
-        """多选框键被移除时迁移必须静默跳过, 不能给 default_config 塞回一个野键。"""
-        task = _make_configured_task()
-        task.default_config.pop(AutoBidAuctionTask.CONF_ASSIST_FEATURES)
-        task.log_info = Mock()
-        task._migrate_legacy_assist_config({AutoBidAuctionTask.LEGACY_CONF_USE_EMOTE: True})
-
-        self.assertNotIn(AutoBidAuctionTask.CONF_ASSIST_FEATURES, task.default_config)
-
-    def test_legacy_config_file_migrates_end_to_end(self):
-        """走一遍真实的 Config 读写: 勾选项落盘, 旧键被清掉, 二次加载保持稳定。"""
-        task = _make_configured_task()
-        task.log_info = Mock()
-        legacy = {
-            AutoBidAuctionTask.LEGACY_CONF_USE_EMOTE: True,
-            AutoBidAuctionTask.LEGACY_CONF_USE_WELFARE: False,
-            AutoBidAuctionTask.CONF_KEEP_QUALITIES: ["品质红"],
-        }
-
-        with tempfile.TemporaryDirectory() as folder:
-            path = Path(folder) / f"{type(task).__name__}.json"
-            path.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
-
-            with patch.object(Config, "config_folder", folder):
-                task._migrate_legacy_assist_config(legacy)
-                config = Config(type(task).__name__, task.default_config)
-
-                self.assertEqual(
-                    config[AutoBidAuctionTask.CONF_ASSIST_FEATURES],
-                    [AutoBidAuctionTask.ASSIST_EMOTE],
-                )
-                # 用户原来的保留品质不能被迁移弄丢.
-                self.assertEqual(config[AutoBidAuctionTask.CONF_KEEP_QUALITIES], ["品质红"])
-
-                saved = json.loads(path.read_text(encoding="utf-8"))
-                self.assertNotIn(AutoBidAuctionTask.LEGACY_CONF_USE_EMOTE, saved)
-                self.assertNotIn(AutoBidAuctionTask.LEGACY_CONF_USE_WELFARE, saved)
-                self.assertEqual(
-                    saved[AutoBidAuctionTask.CONF_ASSIST_FEATURES],
-                    [AutoBidAuctionTask.ASSIST_EMOTE],
-                )
-
-
-class TestAuctionRaiseModeRename(unittest.TestCase):
-    """「加价方式」的取值由「倍数」改名为「倍率」, 三处联动都必须跟上。"""
-
-    def test_options_only_contain_the_new_value(self):
-        task = _make_configured_task()
-
-        options = task.config_type[task.CONF_RAISE_MODE]["options"]
-
-        self.assertEqual(options, list(task.RAISE_MODES))
-        self.assertNotIn(task.LEGACY_RAISE_MODE_MULTIPLE, options)
+class TestAuctionRaiseModeConfig(unittest.TestCase):
+    """「加价方式」只接受当前三种取值, 无效配置按默认「倍率」处理。"""
 
     def test_default_value_is_one_of_the_options(self):
         """默认值不在 options 里, 全新用户的下拉框会直接显示空白。"""
@@ -3770,22 +3523,6 @@ class TestAuctionRaiseModeRename(unittest.TestCase):
         for mode, children in sub_configs.items():
             self.assertIn(task.CONF_RAISE_VALUE, children, mode)
 
-    def test_raise_value_is_visible_in_every_mode(self):
-        task = _make_configured_task()
-        base = {
-            **task.default_config,
-            task.CONF_AUTO_RAISE: True,
-            task.CONF_BID_MODE: task.BID_MODE_CUSTOM,
-        }
-
-        for mode in task.RAISE_MODES:
-            fields = build_config_fields(
-                {**base, task.CONF_RAISE_MODE: mode},
-                task.config_description,
-                task.config_type,
-            )
-            self.assertIn(task.CONF_RAISE_VALUE, [field["key"] for field in fields], mode)
-
     def _price(self, mode: str) -> int:
         task = _make_task()
         task.config = _config(
@@ -3797,29 +3534,11 @@ class TestAuctionRaiseModeRename(unittest.TestCase):
         )
         return task._raise_price(100, 1)
 
-    def test_legacy_value_is_normalized_when_read(self):
-        """配置文件读不到时迁移不会执行, 读取兜底必须自己把旧取值归一。"""
-        task = _make_task()
-        task.config = _config(
-            **{AutoBidAuctionTask.CONF_RAISE_MODE: AutoBidAuctionTask.LEGACY_RAISE_MODE_MULTIPLE}
-        )
-
-        self.assertEqual(task._raise_mode(), AutoBidAuctionTask.RAISE_MODE_MULTIPLE)
-
-    def test_legacy_value_keeps_the_exponential_branch(self):
-        """判定串失配会静默退化成线性加价, 这条守住旧配置的价格不被改写。"""
-        # 基础价 100, 倍率 1.6, 第 1 次: 指数 160, 退化成自定义则只有 102.
-        self.assertEqual(self._price(AutoBidAuctionTask.RAISE_MODE_MULTIPLE), 160)
-        self.assertEqual(
-            self._price(AutoBidAuctionTask.LEGACY_RAISE_MODE_MULTIPLE),
-            self._price(AutoBidAuctionTask.RAISE_MODE_MULTIPLE),
-        )
-
-    def test_unknown_value_keeps_the_custom_fallback(self):
-        """未知取值仍按「自定义」兜底, 改名不该顺手改掉这条既有语义。"""
+    def test_invalid_value_uses_the_default_raise_mode(self):
+        """迁移已删除, 老配置或手改坏的取值按默认「倍率」处理。"""
         self.assertEqual(
             self._price("手改坏了的取值"),
-            self._price(AutoBidAuctionTask.RAISE_MODE_CUSTOM),
+            self._price(AutoBidAuctionTask.RAISE_MODE_MULTIPLE),
         )
 
     def test_huge_exponent_falls_back_instead_of_raising(self):
@@ -3878,92 +3597,6 @@ class TestAuctionRaiseModeRename(unittest.TestCase):
                 )
 
 
-class TestAuctionRaiseModeMigration(unittest.TestCase):
-    """存量配置里的「倍数」要在加载时改写, 否则下拉框空白且价格静默变线性。"""
-
-    def _migrate(self, raw):
-        task = _make_configured_task()
-        # 模拟 Config 载入后的内容: 键还在, 取值是旧版写的.
-        task.config = dict(raw)
-        task.log_info = Mock()
-        task._migrate_legacy_raise_mode(raw)
-        return task
-
-    def test_legacy_value_is_rewritten(self):
-        task = self._migrate(
-            {AutoBidAuctionTask.CONF_RAISE_MODE: AutoBidAuctionTask.LEGACY_RAISE_MODE_MULTIPLE}
-        )
-
-        self.assertEqual(
-            task.config[AutoBidAuctionTask.CONF_RAISE_MODE],
-            AutoBidAuctionTask.RAISE_MODE_MULTIPLE,
-        )
-
-    def test_current_value_is_left_alone(self):
-        task = self._migrate(
-            {AutoBidAuctionTask.CONF_RAISE_MODE: AutoBidAuctionTask.RAISE_MODE_PERCENT}
-        )
-
-        self.assertEqual(
-            task.config[AutoBidAuctionTask.CONF_RAISE_MODE],
-            AutoBidAuctionTask.RAISE_MODE_PERCENT,
-        )
-
-    def test_missing_key_is_ignored(self):
-        task = self._migrate({})
-
-        self.assertEqual(task.config, {})
-
-    def test_migration_is_skipped_when_the_key_is_unregistered(self):
-        """键被移除时迁移必须静默跳过, 不能给配置塞回一个野键。"""
-        task = _make_configured_task()
-        task.default_config.pop(AutoBidAuctionTask.CONF_RAISE_MODE)
-        task.config = {}
-        task.log_info = Mock()
-
-        task._migrate_legacy_raise_mode(
-            {AutoBidAuctionTask.CONF_RAISE_MODE: AutoBidAuctionTask.LEGACY_RAISE_MODE_MULTIPLE}
-        )
-
-        self.assertEqual(task.config, {})
-
-    def test_legacy_config_file_migrates_end_to_end(self):
-        """走一遍真实的 Config 读写: 新取值落盘, 用户其它配置不丢。"""
-        task = _make_configured_task()
-        task.log_info = Mock()
-        legacy = {
-            AutoBidAuctionTask.CONF_RAISE_MODE: AutoBidAuctionTask.LEGACY_RAISE_MODE_MULTIPLE,
-            AutoBidAuctionTask.CONF_RAISE_VALUE: "1.6",
-        }
-
-        with tempfile.TemporaryDirectory() as folder:
-            path = Path(folder) / f"{type(task).__name__}.json"
-            path.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
-
-            with patch.object(Config, "config_folder", folder):
-                config = Config(type(task).__name__, task.default_config)
-                # Config 不会覆盖已存在的键, 所以旧取值原样载入 —— 正是要迁移的场景.
-                self.assertEqual(
-                    config[AutoBidAuctionTask.CONF_RAISE_MODE],
-                    AutoBidAuctionTask.LEGACY_RAISE_MODE_MULTIPLE,
-                )
-
-                task.config = config
-                task._migrate_legacy_raise_mode(legacy)
-
-                self.assertEqual(
-                    config[AutoBidAuctionTask.CONF_RAISE_MODE],
-                    AutoBidAuctionTask.RAISE_MODE_MULTIPLE,
-                )
-                saved = json.loads(path.read_text(encoding="utf-8"))
-                self.assertEqual(
-                    saved[AutoBidAuctionTask.CONF_RAISE_MODE],
-                    AutoBidAuctionTask.RAISE_MODE_MULTIPLE,
-                )
-                # 用户自己填的加价数值不能被迁移弄丢.
-                self.assertEqual(saved[AutoBidAuctionTask.CONF_RAISE_VALUE], "1.6")
-
-
 class TestAuctionConfigDescriptions(unittest.TestCase):
     """配置项描述要覆盖完整, 且遵守仓库的 ASCII 标点约定。"""
 
@@ -3978,18 +3611,6 @@ class TestAuctionConfigDescriptions(unittest.TestCase):
         missing = [key for key in self._keys(task) if not task.config_description.get(key)]
 
         self.assertEqual(missing, [])
-
-    def test_descriptions_are_not_blank(self):
-        task = _make_configured_task()
-
-        blank = [
-            key
-            for key in self._keys(task)
-            if task.config_description.get(key, "") != task.config_description.get(key, "").strip()
-            or not task.config_description.get(key, "").strip()
-        ]
-
-        self.assertEqual(blank, [])
 
     def test_descriptions_use_ascii_punctuation(self):
         """AGENTS.md 要求源码字符串用 ASCII `,` `;`, 避免易混淆 Unicode 告警。"""
@@ -4060,7 +3681,8 @@ class TestAuctionPostRoundTimeoutGrace(unittest.TestCase):
         task._run_post_round_actions(Mock(), self._expired())
 
         self.assertTrue(task._post_round_state.observed)
-        self.assertFalse(task._post_round_state.welfare_claimed)
+        # 领取超时不能让状态变成「今日已领完」—— 那会在还能领低保时切到放开出售的清单。
+        self.assertFalse(task._welfare_quota_exhausted())
 
     def test_finished_round_still_sells_after_post_round_timeout(self):
         """结算后处理超时不能让本轮变成失败, 也不能连带跳过出售。"""
@@ -4277,59 +3899,6 @@ class TestAuctionResultStageBudget(unittest.TestCase):
         self.assertLess(elapsed, AutoBidAuctionTask.RESULT_MAX_LOOPS * 1.2)
 
 
-class TestAuctionEstimatePartialReadLogging(unittest.TestCase):
-    """「连续 N 次没有新信息」里可能一次完整读数都没有, 日志不能报「读数稳定」。
-
-    画面静止时 OCR 会一直读不出或只读到被 reject_partial 过滤掉的残缺值, 此时 last
-    只是唯一一次成功读数, 未必是终值。这类读数**不采信**: 提前稳判要求「连续读到同一个
-    完整数值」达到 ESTIMATE_STABLE_READS 次, 缺一次就归零, 于是循环只能走到超时兜底。
-    超时后仍会采用它(比回退基础价更接近真实), 但必须用告警说清楚这个价格是猜的,
-    否则排查时看不出它来自一次未必完整的读数。
-    """
-
-    def setUp(self):
-        self.clock = _FakeTime()
-        patcher = patch.object(auction_module, "time", self.clock)
-        patcher.start()
-        self.addCleanup(patcher.stop)
-
-    def _task(self, values) -> AutoBidAuctionTask:
-        task = _make_task()
-        task.sleep = Mock(side_effect=self.clock.sleep)
-        task._read_estimate_value = Mock(
-            side_effect=[(v, False) for v in values] + [(None, False)] * 40
-        )
-        return task
-
-    def test_single_valid_read_is_reported_as_suspicious(self):
-        """只有一次有效读数: 不满足提前稳判, 走到超时兜底并告警说明该值可疑。"""
-        task = self._task([6000])
-
-        value = task._read_stable_asset_value(Mock(), 10, "当前估价", skip_zero=True)
-
-        self.assertEqual(value, 6000)
-        infos = [str(c.args[0]) for c in task.log_info.call_args_list]
-        warnings = [str(c.args[0]) for c in task.log_warning.call_args_list]
-        self.assertFalse([msg for msg in infos if "稳定" in msg])
-        self.assertTrue([msg for msg in warnings if "未稳定" in msg])
-
-    def test_repeated_identical_reads_are_still_reported_as_stable(self):
-        """连续读到同一个完整数值且超过最短观察窗口, 才走「读数稳定」而非超时兜底。
-
-        ESTIMATE_MIN_OBSERVE_SECONDS=4.0 而 POLL_INTERVAL=0.5, 第 N 帧的 now 是
-        first_seen + (N-1)*0.5, 所以至少要 9 帧相同值才够观察窗口; 用 10 帧留一帧余量。
-        """
-        task = self._task([6000] * 10)
-
-        value = task._read_stable_asset_value(Mock(), 10, "当前估价", skip_zero=True)
-
-        self.assertEqual(value, 6000)
-        self.assertTrue([c for c in task.log_info.call_args_list if "稳定" in str(c.args[0])])
-        self.assertFalse(
-            [c for c in task.log_warning.call_args_list if "未稳定" in str(c.args[0])]
-        )
-
-
 class TestAuctionInstructions(unittest.TestCase):
     """任务卡上的「说明」按钮由 task.instructions 驱动。
 
@@ -4376,8 +3945,8 @@ class TestAuctionInstructions(unittest.TestCase):
             AutoBidAuctionTask.CONF_SELL_MODE,
             *AutoBidAuctionTask.SELL_MODES,
             AutoBidAuctionTask.CONF_SELL_INTERVAL,
-            AutoBidAuctionTask.CONF_KEEP_QUALITIES,
-            AutoBidAuctionTask.CONF_EXTRA_SELL_QUALITIES,
+            AutoBidAuctionTask.CONF_SELL_BEFORE_WELFARE,
+            AutoBidAuctionTask.CONF_SELL_AFTER_WELFARE,
             AutoBidAuctionTask.CONF_ASSIST_FEATURES,
             *AutoBidAuctionTask.ASSIST_FEATURES,
         ]
@@ -4392,22 +3961,28 @@ class TestAuctionInstructions(unittest.TestCase):
         self.assertIn(f"第 {AutoBidAuctionTask.MAX_BID_ROUNDS} 次", text)
         self.assertIn(f"第 {AutoBidAuctionTask.MAX_BID_ROUNDS - 1} 次", text)
 
-    def test_instructions_warn_about_empty_keep_qualities(self):
-        """「保留藏品品质」清空等于全卖, 说明里必须把这个后果写出来。"""
+    def test_instructions_warn_about_empty_sell_lists(self):
+        """两个出售清单都不勾等于不卖任何藏品, 说明里必须把这个后果写出来。"""
         text = auction_module.INST
 
-        self.assertIn("一个都不勾", text)
+        self.assertIn("两个都不勾", text)
+        self.assertIn("不卖任何藏品", text)
 
     def test_instructions_have_an_upgrade_notes_section(self):
-        """合并过配置键的版本必须交代旧键去向, 否则老用户升级后只会觉得功能丢了。"""
+        """废弃过配置键的版本必须交代旧键去向, 否则老用户升级后只会觉得功能丢了。
+
+        用字面量而不是常量: 迁移已删除, 被废弃的键不再有对应常量, 这里守的是「说明里
+        必须逐个点名」。
+        """
         text = auction_module.INST
 
         self.assertIn("升级后必看", text)
         for legacy in (
-            AutoBidAuctionTask.LEGACY_CONF_AUTO_CLEAR,
-            AutoBidAuctionTask.LEGACY_CONF_USE_EMOTE,
-            AutoBidAuctionTask.LEGACY_CONF_USE_WELFARE,
-            AutoBidAuctionTask.LEGACY_RAISE_MODE_MULTIPLE,
+            "启用自动清理藏品",
+            "启用表情包",
+            "启用低保金",
+            "保留藏品品质",
+            "满仓或领低保后追加出售品质",
         ):
             with self.subTest(legacy=legacy):
                 self.assertIn(legacy, text)

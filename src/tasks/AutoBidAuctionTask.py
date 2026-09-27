@@ -2,11 +2,11 @@ import math
 import re
 import time
 from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from enum import Enum
 
-from ok import Box, Config, TaskDisabledException, WaitFailedException
-from ok.util.file import get_relative_path, read_json_file
+from ok import Box, TaskDisabledException, WaitFailedException
 
 from src.tasks.BaseNTETask import BaseNTETask
 from src.tasks.NTEOneTimeTask import NTEOneTimeTask
@@ -32,6 +32,9 @@ RE_PRICE_HINT = re.compile(r"[~\uff5e\u4e00-\u9fff]")
 RE_MAIN_TITLE = re.compile(r"即刻落槌")
 RE_COLLECTION_INSUFFICIENT = re.compile(r"少于200格")
 RE_WELFARE = re.compile(r"低保金")
+# 弹窗正文「今日已领取次数：N/5」。这是「今日低保是否领完」的权威读数, 直接决定
+# 能不能放开出售, 因此不再依赖「弹窗里还有没有领取按钮」这类间接信号。
+RE_WELFARE_COUNTER = re.compile(r"次数\s*[：:]\s*([0-9\uff10-\uff19]+)\s*/\s*([0-9\uff10-\uff19]+)")
 RE_CLAIM = re.compile(r"领取")
 RE_CANCEL = re.compile(r"取消")
 RE_WAREHOUSE = re.compile(r"藏品仓库")
@@ -48,8 +51,11 @@ RE_CITY_FUN = re.compile(r"都市闲趣")
 # 拍卖主界面右侧的会场文字, 形如「当前：海贝场」。回场后用它核对会场有没有被重置。
 RE_CURRENT_VENUE = re.compile(r"当前")
 
-# 全角数字转半角, 用于统一资产与价格的 OCR 文本。
-FULLWIDTH_DIGITS = str.maketrans("０１２３４５６７８９", "0123456789")
+# 全角数字与全角逗号统一转半角, 用于统一资产与价格的 OCR 文本。
+# 逗号必须一起转: _is_partial_number_text / _has_inconsistent_grouping 靠
+# re.sub(r"[^\d,]", "") 保留半角逗号来识别「首位漏读 / 分组不自洽」, 全角逗号「，」
+# 不在保留范围里会被当噪声删掉, 「，643」就此洗成「643」, 两条残缺读数防线同时失效。
+FULLWIDTH_NUMERIC = str.maketrans("０１２３４５６７８９，", "0123456789,")
 
 # 数字键盘上一次点击即可输入的快捷键, 需优先于逐位输入。
 PAD_SHORTCUTS = ("0000", "00")
@@ -90,6 +96,7 @@ class AuctionBoxes:
     insufficient: Box
     welfare_btn: Box
     welfare_dialog: Box
+    welfare_counter: Box
     claim: Box
     cancel: Box
     warehouse_btn: Box
@@ -116,7 +123,6 @@ class PostRoundState:
     """
 
     inventory_full: bool | None = None
-    welfare_claimed: bool = False
     observed: bool = False
 
 
@@ -176,10 +182,15 @@ INST = "<br>".join(
             indent=2,
         ),
         _inst_line(
-            "「保留藏品品质」勾选的不卖, 一个都不勾 = 全卖; 「满仓或领低保后追加出售品质」",
+            "「未领完低保时出售品质 / 已领完低保时出售品质」勾选即出售, 没勾的一律保留,"
+            " 两个都不勾 = 不卖任何藏品",
             indent=2,
         ),
-        _inst_line("会在满仓或领低保时连保留品质一起卖", indent=2),
+        _inst_line(
+            "清单按低保「今日次数领满」自动切换: 没领满时别勾高价值品质, 卖藏品会抬高资产,"
+            " 资产过 10 万就领不到低保",
+            indent=2,
+        ),
         _inst_line(
             "✨ 「启用辅助功能」: 表情包 = 出价后发表情; 低保金 = 资产低于 10 万时领取",
             "#FF5555",
@@ -187,15 +198,20 @@ INST = "<br>".join(
         ),
         _inst_line("🔄 升级后必看", "#FF5555", bold=True),
         _inst_line(
-            "旧版「启用自动清理藏品 / 出售藏品间隔次数 / 启用表情包 / 启用低保金」已合并进",
-            "#FE821D",
+            "旧版「启用自动清理藏品 / 启用表情包 / 启用低保金 / 保留藏品品质 /",
+            "#FF5555",
             bold=True,
             indent=1,
         ),
         _inst_line(
-            "「出售藏品模式」与「启用辅助功能」, 首次启动自动换算, 旧键消失属正常", indent=2
+            "满仓或领低保后追加出售品质」已废弃, 不再自动换算, 首次启动一律按上面的默认值重建",
+            "#FF5555",
+            bold=True,
+            indent=2,
         ),
-        _inst_line("「加价方式」旧值「倍数」已改名「倍率」, 自动改写", indent=2),
+        _inst_line(
+            "旧配置里的无效「加价方式」不再迁移, 会按默认「倍率」处理; 下拉框若显示空白请重选", indent=2
+        ),
         _inst_line("「按系统估价」读估价会多等约 1 秒(防误读成 1/10 价格), 不是卡住", indent=2),
         _inst_line(
             "想让本机配置回到这套默认: 面板点「重置配置」, 它会清掉你填过的值(含价格),",
@@ -210,7 +226,7 @@ INST = "<br>".join(
             indent=2,
         ),
         _inst_line(
-            "⚠️ 出价失败会自动重试, 单轮失败不影响后续轮次; 仓库卖不掉时会放宽保留品质", indent=1
+            "⚠️ 出价失败会自动重试, 单轮失败不影响后续轮次; 仓库卖不掉时会放宽出售清单", indent=1
         ),
     ]
 )
@@ -248,14 +264,18 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
     )
 
     CONF_SELL_INTERVAL = "出售藏品间隔次数"
-    CONF_KEEP_QUALITIES = "保留藏品品质"
+    # 两个出售品质清单都是「勾选即出售」: 勾了才卖, 没勾的一律保留。
+    # 用哪个清单由当日低保阶段自动决定, 见 _sell_qualities。
+    CONF_SELL_BEFORE_WELFARE = "未领完低保时出售品质"
+    CONF_SELL_AFTER_WELFARE = "已领完低保时出售品质"
+    SELL_QUALITY_KEYS = (CONF_SELL_BEFORE_WELFARE, CONF_SELL_AFTER_WELFARE)
 
     # 自动加价配置.
     CONF_AUTO_RAISE = "启用自动加价"
     CONF_RAISE_MODE = "加价方式"
     # 加价方式的取值既是下拉框标签, 又是持久化的配置值, 还被 _raise_price 当判定串用。
-    # 改这几个取值必须配套迁移(见 _migrate_legacy_raise_mode), 否则老用户的下拉框会显示
-    # 空白, 而且判定串失配后会静默落到「自定义」分支, 算出完全不同的价格。
+    # 改这几个取值会让老用户的下拉框显示空白, 而且判定串失配后会静默落到「自定义」分支,
+    # 算出完全不同的价格 —— 所以除了改名, 还要在 _raise_mode 里加读取兜底。
     RAISE_MODE_MULTIPLE = "倍率"
     RAISE_MODE_CUSTOM = "自定义"
     RAISE_MODE_PERCENT = "百分比"
@@ -279,21 +299,12 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
     MAX_BID_ROUNDS = 6
     CONF_BID_PRICES = tuple(f"第{index}次出价价格" for index in range(1, MAX_BID_ROUNDS + 1))
 
-    CONF_EXTRA_SELL_QUALITIES = "满仓或领低保后追加出售品质"
-
     # 拍卖辅助功能: 多选框, 勾选即启用.
     CONF_ASSIST_FEATURES = "启用辅助功能"
     ASSIST_EMOTE = "表情包"
     ASSIST_WELFARE = "低保金"
     ASSIST_FEATURES = (ASSIST_EMOTE, ASSIST_WELFARE)
 
-    # 旧版配置键, 已合并进 CONF_SELL_MODE, 只在迁移时读取, 不再注册到 GUI.
-    LEGACY_CONF_AUTO_CLEAR = "启用自动清理藏品"
-    # 旧版辅助功能开关, 已合并进 CONF_ASSIST_FEATURES 的勾选项, 只在迁移时读取.
-    LEGACY_CONF_USE_EMOTE = "启用表情包"
-    LEGACY_CONF_USE_WELFARE = "启用低保金"
-    # 旧版加价方式取值, 已改名为「倍率」, 只在迁移与读取兜底时使用.
-    LEGACY_RAISE_MODE_MULTIPLE = "倍数"
 
     # --- UI 坐标 (相对比例) ---
     # 主界面按钮.
@@ -354,6 +365,11 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
     # 低保金.
     BOX_WELFARE_BTN = (0.8266, 0.0398, 0.8984, 0.0778)
     BOX_WELFARE_DIALOG = (0.4400, 0.3050, 0.5650, 0.3620)  # 弹窗标题
+    # 「今日已领取次数：N/5」整行(标签 + 数值)。必须连标签一起框: 孤立的小号数字
+    # (如 "0/5") 检测模型读不出来, 整行框实测 1/2/3/4/6 五个缩放档都能读出 0/5。
+    # 上下边界夹在「当前资产」行与按钮行之间, 只有约 20px 余量, 改前先在
+    # ok_templates/22.png、43.png(两张真实低保金弹窗截图)上复验。
+    BOX_WELFARE_COUNTER = (0.4100, 0.5150, 0.5950, 0.5820)
     BOX_CLAIM = (0.576, 0.636, 0.632, 0.685)
     BOX_CANCEL = (0.370, 0.637, 0.421, 0.684)
 
@@ -419,8 +435,8 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
     # 库存不足提示条出现时机不定, 给 1 秒容易漏掉(漏掉就不会提前清理, 满仓会卡住).
     INVENTORY_FULL_TIMEOUT = 3
 
-    # 出售连续失败到这个次数后放宽「保留品质」再试一次: 满仓卖不掉会让后续出价全部失败,
-    # 这时候把仓库腾空的优先级高于保留指定品质.
+    # 出售连续失败到这个次数后放宽出售清单(6 个品质全卖)再试一次: 满仓卖不掉会让后续
+    # 出价全部失败, 这时候把仓库腾空的优先级高于按低保阶段挑选品质.
     SELL_FAILURE_ESCALATE_AFTER = 2
 
     # 轮次末尾出售流程的总预算。出售是收尾动作, 不该像拍卖阶段那样吃掉整轮 600 秒:
@@ -518,6 +534,15 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
     # 低保金弹窗关闭重试次数, 每日次数用尽时弹窗没有领取按钮, 只能靠取消关闭.
     WELFARE_CLOSE_RETRIES = 3
 
+    # 低保金每日刷新时刻(游戏每日 5 点重置, 与 src/config.py 的「Monthly Card Time」默认值一致)。
+    # 只用于跨天清空当日领取记录; 具体次数与上限一律以弹窗读数「今日已领取次数：N/5」为准,
+    # 所以这里不写死「每日 5 次」—— 游戏改上限时不需要跟着改代码。
+    WELFARE_RESET_HOUR = 5
+    # 弹窗次数读数最多读几帧、换帧间隔多少秒。只读一帧时弹窗淡入中的空白帧会让这次
+    # 读数落空, 而资产涨过 10 万后弹窗不再打开, 当天就再也读不到了(追加出售静默失效)。
+    WELFARE_COUNTER_READS = 2
+    WELFARE_COUNTER_RETRY_GAP = 0.3
+
     # --- 掉线回场 (秒/次) ---
     # 网络不稳时匹配阶段会被踢回大世界, 界面状态全不命中, 只能空转到 MATCH_TIMEOUT。
     # 回场是一次性的异常路径: 失败就按本轮失败处理, 交给下一轮重试。
@@ -556,11 +581,14 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         self.default_config.update(
             {
                 # 出售藏品相关配置集中放在最前面, 由模式下拉框统一控制可见性,
-                # 避免「出售间隔 / 保留品质 / 自动清理」散落在面板各处.
+                # 避免「出售间隔 / 出售品质 / 自动清理」散落在面板各处.
                 self.CONF_SELL_MODE: self.SELL_MODE_ONE_CLICK,
                 self.CONF_SELL_INTERVAL: 0,
-                self.CONF_KEEP_QUALITIES: ["品质红"],
-                self.CONF_EXTRA_SELL_QUALITIES: [],
+                # 还没领完低保时只卖低价值品质: 低保金的领取前提是资产低于 10 万,
+                # 而卖藏品会抬高资产, 卖多了当天剩下的低保就领不到了.
+                self.CONF_SELL_BEFORE_WELFARE: ["品质白", "品质绿", "品质蓝"],
+                # 领完当日次数后低保已无望, 这时可以放开更高价值的品质.
+                self.CONF_SELL_AFTER_WELFARE: ["品质白", "品质绿", "品质蓝", "品质紫"],
                 self.CONF_AUTO_RAISE: False,
                 self.CONF_FIXED_PRICE: 1,
                 self.CONF_BID_MODE: self.BID_MODE_ESTIMATE,
@@ -602,11 +630,11 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
                     self.RAISE_MODE_PERCENT: [self.CONF_RAISE_VALUE],
                 },
             },
-            self.CONF_KEEP_QUALITIES: {
+            self.CONF_SELL_BEFORE_WELFARE: {
                 "type": "multi_selection",
                 "options": list(self.QUALITY_KEYS),
             },
-            self.CONF_EXTRA_SELL_QUALITIES: {
+            self.CONF_SELL_AFTER_WELFARE: {
                 "type": "multi_selection",
                 "options": list(self.QUALITY_KEYS),
             },
@@ -614,20 +642,16 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
                 "type": "multi_selection",
                 "options": list(self.ASSIST_FEATURES),
             },
-            # 出售模式把「出售间隔 / 保留品质 / 追加出售品质」收在同一处:
+            # 出售模式把「出售间隔 / 两个出售品质清单」收在同一处:
             # 选「不出售」时这些子项全部隐藏, 面板只剩一个下拉框.
             self.CONF_SELL_MODE: {
                 "options": list(self.SELL_MODES),
                 "sub_configs": {
                     self.SELL_MODE_OFF: [],
-                    self.SELL_MODE_FULL: [
-                        self.CONF_KEEP_QUALITIES,
-                        self.CONF_EXTRA_SELL_QUALITIES,
-                    ],
+                    self.SELL_MODE_FULL: list(self.SELL_QUALITY_KEYS),
                     self.SELL_MODE_INTERVAL: [
                         self.CONF_SELL_INTERVAL,
-                        self.CONF_KEEP_QUALITIES,
-                        self.CONF_EXTRA_SELL_QUALITIES,
+                        *self.SELL_QUALITY_KEYS,
                     ],
                     # 一键出售用游戏自带的整包出售, 没有品质勾选也没有间隔, 因此没有子项.
                     self.SELL_MODE_ONE_CLICK: [],
@@ -655,11 +679,12 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
                 "卖掉本局藏品, 不做满仓检测也不筛选品质",
                 self.CONF_SELL_INTERVAL: "每 N 轮出售一次, 满仓时提前触发; 填 0 会退化成只按"
                 "满仓清理",
-                self.CONF_KEEP_QUALITIES: "勾选的品质不出售, 其余品质全部出售; 一个都不勾会卖掉"
-                "全部藏品",
-                self.CONF_EXTRA_SELL_QUALITIES: "满仓或成功领取低保金时, 这些品质会覆盖"
-                "「保留藏品品质」一并出售, 用于腾出仓位; 只对保留列表里勾选的品质有效, "
-                "勾其他品质不会改变行为",
+                self.CONF_SELL_BEFORE_WELFARE: "勾选即出售: 今日低保次数还没领满时卖这些"
+                "品质, 没勾的一律保留; 低保金的领取前提是资产低于 10 万, 而卖藏品会抬高"
+                "资产, 所以这一档只勾低价值品质",
+                self.CONF_SELL_AFTER_WELFARE: "勾选即出售: 今日低保次数领满后卖这些品质;"
+                "领满之后当天再也领不到低保, 可以放开勾选更高价值的品质; 一般应包含"
+                "「未领完低保时出售品质」勾选的全部品质, 否则领满后反而卖得更少",
                 # --- 出价 ---
                 self.CONF_AUTO_RAISE: "在基础价之上按「加价方式」逐次提高出价",
                 self.CONF_FIXED_PRICE: "自定义价格的基准价; 必须为正整数, 否则任务不会启动",
@@ -702,117 +727,14 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         # 藏品出售连续失败计数: 满仓卖不掉时后续出价必然失败, 需要升级处理而不是每轮重试.
         self._sell_failures = 0
         self._inventory_stuck = False
+        # 当日低保领取记录. 次数与上限都从弹窗「今日已领取次数：N/5」读回来, 本地
+        # 累计只在弹窗不再打开(资产高于阈值)时补位, 下次读数会整体覆盖。
+        self._welfare_day: date | None = None
+        self._welfare_claims_today = 0
+        self._welfare_daily_limit: int | None = None
         # 启用基类的睡眠钩子, 拍卖流程跨过每日 5 点时靠它处理月卡弹窗.
         self.sleep_check_interval = self.SLEEP_CHECK_INTERVAL
         self.add_exit_after_config()
-
-    # --- 配置迁移 ---
-    @staticmethod
-    def _migrate_sell_mode(raw: dict) -> str:
-        """把旧版「启用自动清理藏品 / 出售藏品间隔次数」换算成新的出售模式。
-
-        旧版两档是互斥的: 自动清理开启时忽略间隔, 只按满仓触发; 关闭时按间隔触发,
-        满仓会提前触发。因此 自动清理=True -> 满仓时清理, 间隔>0 -> 按间隔出售。
-        """
-        if not isinstance(raw, dict):
-            return AutoBidAuctionTask.SELL_MODE_OFF
-        if raw.get(AutoBidAuctionTask.LEGACY_CONF_AUTO_CLEAR) is True:
-            return AutoBidAuctionTask.SELL_MODE_FULL
-        interval = raw.get(AutoBidAuctionTask.CONF_SELL_INTERVAL)
-        # bool 是 int 的子类, True 不该被当成间隔 1.
-        if isinstance(interval, int) and not isinstance(interval, bool) and interval > 0:
-            return AutoBidAuctionTask.SELL_MODE_INTERVAL
-        return AutoBidAuctionTask.SELL_MODE_OFF
-
-    def load_config(self):
-        """加载配置前先迁移旧版取值, 否则老用户升级后会静默改变行为。
-
-        出售模式迁移必须发生在 super().load_config() 之前: Config 会按 default_config
-        补齐缺失的键并落盘, 写进 default_config 的值就是最终写回用户文件的值。
-        辅助功能迁移同理 —— 新键是列表型多选框, 旧键会被同一次 verify 清掉。
-        加价方式迁移相反 —— 键还在、只是取值变了, Config 不会覆盖已存在的键, 所以只能
-        在 self.config 建好之后再改写, 靠 Config.__setitem__ 自己落盘。
-        """
-        raw = self._read_raw_config()
-        self._migrate_legacy_sell_config(raw)
-        self._migrate_legacy_assist_config(raw)
-        super().load_config()
-        self._migrate_legacy_raise_mode(raw)
-
-    def _read_raw_config(self) -> dict:
-        """读取落盘的用户配置原文, 文件不存在或格式不对时返回空字典。"""
-        config_file = get_relative_path(Config.config_folder, f"{type(self).__name__}.json")
-        raw = read_json_file(config_file)
-        return raw if isinstance(raw, dict) else {}
-
-    def _migrate_legacy_sell_config(self, raw: dict) -> None:
-        """配置里还没有新模式键时, 用旧版的两个键推导出模式并写进默认值。
-
-        写进 default_config 后 verify_config 会用该值补齐配置并落盘, 所以迁移只发生
-        一次; 旧键不在 default_config 里, 会在同一次 verify 中被清掉。
-        """
-        if self.CONF_SELL_MODE not in self.default_config:
-            return
-        if self.CONF_SELL_MODE in raw:
-            return
-        if self.CONF_SELL_INTERVAL not in raw and self.LEGACY_CONF_AUTO_CLEAR not in raw:
-            # 全新用户, 没有需要迁移的旧值.
-            return
-        mode = self._migrate_sell_mode(raw)
-        self.default_config[self.CONF_SELL_MODE] = mode
-        self.log_info(f"已按旧版出售开关迁移「{self.CONF_SELL_MODE}」为: {mode}")
-
-    @staticmethod
-    def _migrate_assist_features(raw: dict) -> list:
-        """把旧版两个辅助开关换算成多选框的勾选项列表。
-
-        只有显式 True 才算勾选: 旧键缺失、False, 以及用户手工填的字符串都按未勾选处理。
-        """
-        if not isinstance(raw, dict):
-            return []
-        pairs = (
-            (AutoBidAuctionTask.ASSIST_EMOTE, AutoBidAuctionTask.LEGACY_CONF_USE_EMOTE),
-            (AutoBidAuctionTask.ASSIST_WELFARE, AutoBidAuctionTask.LEGACY_CONF_USE_WELFARE),
-        )
-        return [feature for feature, key in pairs if raw.get(key) is True]
-
-    def _migrate_legacy_assist_config(self, raw: dict) -> None:
-        """配置里还没有多选框键时, 用旧版两个开关推导出勾选项并写进默认值。
-
-        旧键「启用表情包 / 启用低保金」不在 default_config 里, 会在同一次 verify 中
-        被清掉, 所以迁移只发生一次。
-        """
-        if self.CONF_ASSIST_FEATURES not in self.default_config:
-            return
-        if self.CONF_ASSIST_FEATURES in raw:
-            return
-        if self.LEGACY_CONF_USE_EMOTE not in raw and self.LEGACY_CONF_USE_WELFARE not in raw:
-            # 全新用户, 没有需要迁移的旧值.
-            return
-        features = self._migrate_assist_features(raw)
-        self.default_config[self.CONF_ASSIST_FEATURES] = features
-        self.log_info(
-            f"已按旧版辅助开关迁移「{self.CONF_ASSIST_FEATURES}」为: "
-            f"{', '.join(features) if features else '未勾选'}"
-        )
-
-    def _migrate_legacy_raise_mode(self, raw: dict) -> None:
-        """把「加价方式」的旧取值「倍数」改写为「倍率」。
-
-        取值同时是下拉框选项和价格计算的判定串: 不改写会让下拉框显示空白, 而且
-        _raise_price 里的判定失配后会静默落到「自定义」分支, 价格从指数增长变成线性
-        增长, 不报错也不告警。迁移后旧取值不再出现, 重复执行是无操作。
-        """
-        if self.CONF_RAISE_MODE not in self.default_config:
-            return
-        if raw.get(self.CONF_RAISE_MODE) != self.LEGACY_RAISE_MODE_MULTIPLE:
-            return
-        # __setitem__ 在取值真的变化时会自己 save_file().
-        self.config[self.CONF_RAISE_MODE] = self.RAISE_MODE_MULTIPLE
-        self.log_info(
-            f"已迁移「{self.CONF_RAISE_MODE}」的旧值 {self.LEGACY_RAISE_MODE_MULTIPLE}"
-            f" 为 {self.RAISE_MODE_MULTIPLE}"
-        )
 
     # --- 任务入口 ---
     def run(self):
@@ -834,12 +756,23 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
             # 否则任务抛错退出后连轮次汇总日志和结束通知都不会发出。
             self._validate_price_config()
             self._warn_if_no_sellable_quality()
-            self._warn_if_extra_sell_is_redundant()
             boxes = self._build_boxes()
             while self.has_remaining_rounds():
                 if not self.begin_round():
                     break
                 try:
+                    # 残留的藏品仓库会盖住主界面标题与全部拍卖控件, 不先收起,
+                    # 入口探测与匹配阶段的四种状态判定全部落空, 每轮都在
+                    # MATCH_TIMEOUT(120 秒) 上空烧到异常. 下方的轮末仓库检查只在
+                    # _run_single_round 正常返回时执行, 启动前残留(上次进程被杀 /
+                    # 手动开着)或异常路径都轮不到它, 所以每轮开头先查:
+                    # 开着先收一次, 收不掉才停止.
+                    if self._is_warehouse_open(boxes):
+                        self.log_warning("检测到藏品仓库仍开着, 先收起再继续本轮")
+                        self._close_warehouse(boxes)
+                        if self._is_warehouse_open(boxes):
+                            self.log_error("藏品仓库未关闭且无法自动收起, 停止后续轮次")
+                            break
                     # 每轮都重新确认一次入口, 与 AutoHeistTask._run_loop「每轮先
                     # ensure_main + 入口判断」保持一致: 上一轮掉线或异常退出时人可能已经
                     # 不在拍卖界面, 只在循环外确认一次的话, 后续每轮都要在 _stage_match
@@ -1101,6 +1034,7 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
             insufficient=screen(*self.BOX_INSUFFICIENT),
             welfare_btn=screen(*self.BOX_WELFARE_BTN),
             welfare_dialog=screen(*self.BOX_WELFARE_DIALOG),
+            welfare_counter=screen(*self.BOX_WELFARE_COUNTER),
             claim=screen(*self.BOX_CLAIM),
             cancel=screen(*self.BOX_CANCEL),
             warehouse_btn=screen(*self.BOX_WAREHOUSE_BTN),
@@ -1155,6 +1089,9 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         """执行一轮拍卖, 记录结果并仅在确认回到主界面后触发出售。"""
         # 结算后处理会把本轮的满仓与低保金结果写回, 每轮开始前先清空上一轮的观测.
         self._post_round_state = PostRoundState()
+        # 跨过每日刷新时刻(5 点)时清空当日低保领取记录, 否则昨天领满的记录会让今天
+        # 一开局就按「已领完」放开出售.
+        self._rollover_welfare_day()
 
         if self._inventory_stuck:
             # 上一轮满仓且出售未成功: 仓库腾不出空间时这一轮出价必然失败,
@@ -1748,10 +1685,11 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         # 观测失败(未读出)只返回 None, 不影响后续低保金与出售流程。
         asset_value = self._observe_main_asset(boxes, deadline)
 
-        welfare_claimed = False
+        # 领取结果不再参与出售决策: 追加出售看的是「今日低保是否领完」(任务级状态,
+        # 由弹窗读数维护), 不是「本轮有没有领到」。这里只负责把领取流程走完。
         if self._assist_enabled(self.ASSIST_WELFARE):
             try:
-                welfare_claimed = self._claim_welfare_if_needed(boxes, deadline, asset_value)
+                self._claim_welfare_if_needed(boxes, deadline, asset_value)
             except TaskDisabledException:
                 raise
             except WaitFailedException as e:
@@ -1763,7 +1701,6 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
 
         self._post_round_state = PostRoundState(
             inventory_full=inventory_full,
-            welfare_claimed=welfare_claimed,
             observed=True,
         )
 
@@ -1776,7 +1713,7 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         """判断「启用辅助功能」多选框里是否勾选了某个功能。
 
         多选框存的是勾选项列表, 未勾选时为空列表。值不是列表(用户手工改成字符串或
-        迁移未落盘的旧 bool)时一律按未勾选处理: 少发一个表情、少领一次低保金都是可
+        配置仍为旧 bool)时一律按未勾选处理: 少发一个表情、少领一次低保金都是可
         恢复的, 不该因为脏配置去点不存在的按钮。
         """
         selected = self.config.get(self.CONF_ASSIST_FEATURES, ())
@@ -1983,17 +1920,35 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         except (TypeError, ValueError):
             return []
 
-    def _quality_selection(self) -> tuple[list[str], list[str]]:
-        """读取「保留藏品品质」与「追加出售品质」, 非列表值一律按空列表处理。
+    def _quality_list(self, key: str) -> list[str]:
+        """读取某个出售品质清单, 值不是列表时按空清单处理。"""
+        raw = self.config.get(key, [])
+        if not isinstance(raw, (list, tuple)):
+            return []
+        return [name for name in self.QUALITY_KEYS if name in raw]
 
-        两个键都是多选框(配置值是列表), 但用户可能手工改成字符串或留下旧版脏值。
-        清洗集中在这里: 调用方一律拿到列表, 不必各自判断类型。
+    def _sell_qualities(self) -> list[str]:
+        """按当日低保阶段返回本轮要出售的品质清单。
+
+        两个清单都是「勾选即出售」: 勾了才卖, 没勾的一律保留。低保金的领取前提是资产
+        低于 10 万, 而卖藏品会抬高资产 —— 所以「还没领满」阶段只卖低价值品质, 领满
+        当日次数后才放开高价值品质(领满之后当天再也领不到低保, 这时多卖才不亏)。
+
+        ⚠️ 判定依据是「今日低保**领满**」而不是「今天领到过」: 旧实现每次领取成功就
+        追加出售, 于是「领 1 次 → 卖一次 → 资产过线 → 之后再也领不到」自我阻断, 用户
+        要花更多场次把资产花下去才能领下一次。读不到弹窗读数(资产高于阈值, 弹窗不再
+        打开)时按「还没领满」处理: 少卖一次只是少赚, 卖错了却会让当天剩下的低保领不到。
+
+        ⚠️ 满仓**不**切换清单: 满仓只说明必须腾空间, 不代表低保已无望, 按低保阶段保守
+        地卖才符合「领低保优先」; 真腾不出空间时有既有的放宽机制兜底(连续满仓失败后
+        6 个品质全卖, 见 _sell_collections_with_escalation)。
         """
-        keep = self.config.get(self.CONF_KEEP_QUALITIES, [])
-        keep = list(keep) if isinstance(keep, (list, tuple)) else []
-        extra = self.config.get(self.CONF_EXTRA_SELL_QUALITIES, [])
-        extra = list(extra) if isinstance(extra, (list, tuple)) else []
-        return keep, extra
+        key = (
+            self.CONF_SELL_AFTER_WELFARE
+            if self._welfare_quota_exhausted()
+            else self.CONF_SELL_BEFORE_WELFARE
+        )
+        return self._quality_list(key)
 
     def _validate_price_config(self) -> None:
         """任务开始前校验价格相关配置, 非法时直接终止任务。
@@ -2027,12 +1982,20 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
             raise ValueError(f"基础价必须为正整数, 当前: {base_raw!r}")
 
         if self.config.get(self.CONF_AUTO_RAISE, False):
-            raise_value = self._config_float(self.CONF_RAISE_VALUE, 0.0)
-            if not math.isfinite(raise_value):
+            # 校验必须与 _raise_price 同口径(_config_decimal 的 Decimal 解析): 若用
+            # _config_float, 非法字符串会回退成 0.0 顺利通过, 运行时自定义/百分比
+            # 模式拿着 0 静默按基础价出价, 用户完全无感.
+            try:
+                raise_value = Decimal(str(self.config.get(self.CONF_RAISE_VALUE)))
+            except (ArithmeticError, ValueError):
+                raise ValueError(
+                    f"加价数值配置非法: {self.config.get(self.CONF_RAISE_VALUE)!r}"
+                ) from None
+            if not raise_value.is_finite():
                 raise ValueError(f"加价数值配置非法: {self.config.get(self.CONF_RAISE_VALUE)!r}")
 
     def _warn_if_no_sellable_quality(self) -> None:
-        """保留品质覆盖全部品质时给出告警: 开了出售模式却没有可出售的品质。
+        """两个出售品质清单都为空时给出告警: 开了出售模式却没有可出售的品质。
 
         配置本身不非法(用户可以随时改), 所以只告警不拦截。但满仓时这种配置会让
         出售一直报「成功」却清不出空间, 之后每轮出价都失败, 提前说清楚更好排查。
@@ -2040,39 +2003,11 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         if not self._uses_collection_sell():
             return
 
-        keep, extra = self._quality_selection()
-
-        # 追加出售的品质会覆盖保留列表, 所以只要有一个品质「该卖」就不算空配置.
-        if any(name in extra or name not in keep for name in self.QUALITY_KEYS):
+        if any(self._quality_list(key) for key in self.SELL_QUALITY_KEYS):
             return
         self.log_warning(
-            f"「{self.CONF_KEEP_QUALITIES}」保留了全部品质且没有追加出售品质, "
-            "本次运行不会清掉任何藏品"
-        )
-
-    def _warn_if_extra_sell_is_redundant(self) -> None:
-        """「追加出售品质」里勾了不在「保留品质」里的品质时给出告警。
-
-        追加只在「该品质本来要保留」时才改变行为: 不在保留列表里的品质本来就会出售,
-        勾进追加列表等于没勾。而这个组合又很自然(看到「追加出售」就把低价值品质勾上),
-        所以提前说清楚, 免得用户以为配置生效了。
-
-        配置本身不非法(用户可能有意预留), 因此只告警不拦截。
-        """
-        if not self._uses_collection_sell():
-            return
-
-        keep, extra = self._quality_selection()
-        keep = set(keep)
-
-        # 只关心品质枚举里的项: 脏配置里的未知名称既不会生效, 也不该被拿出来说.
-        redundant = [n for n in extra if n in self.QUALITY_KEYS and n not in keep]
-        if not redundant:
-            return
-        self.log_warning(
-            f"「{self.CONF_EXTRA_SELL_QUALITIES}」里的 "
-            + ", ".join(redundant)
-            + f" 不在「{self.CONF_KEEP_QUALITIES}」中, 本来就会出售, 追加设置对它们无效"
+            f"「{self.CONF_SELL_BEFORE_WELFARE}」与「{self.CONF_SELL_AFTER_WELFARE}」"
+            "都没有勾选品质, 本次运行不会清掉任何藏品"
         )
 
     # --- 资产解析 ---
@@ -2081,12 +2016,12 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         """统一解析资产 OCR 文本, 返回整数或 None。
 
         处理流程:
-        1. 全角数字转半角数字.
+        1. 全角数字与全角逗号转半角.
         2. 修正常见 OCR 错误 (O -> 0, l/I -> 1).
         3. 提取数字.
         4. 转换为 int, 失败时返回 None.
         """
-        normalized = raw_text.translate(FULLWIDTH_DIGITS)
+        normalized = raw_text.translate(FULLWIDTH_NUMERIC)
         corrected = normalized.replace("l", "1").replace("I", "1").replace("O", "0")
         digits = re.sub(r"[^\d]", "", corrected)
         if not digits:
@@ -2105,7 +2040,7 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         不稳定, 漏读时会剩下 ",544" 这种逗号前空着的文本 (线上日志 18:56 那局连着 9 次),
         它对应的真实值至少是 "x,544"。把它当结果会按低一个数量级的价格出价。
         """
-        normalized = raw_text.translate(FULLWIDTH_DIGITS)
+        normalized = raw_text.translate(FULLWIDTH_NUMERIC)
         digits_and_commas = re.sub(r"[^\d,]", "", normalized)
         return digits_and_commas.startswith(",")
 
@@ -2120,7 +2055,7 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         注意这条拦不住 `643`(无逗号, 天然自洽), 所以它只是辅助防线; 末位丢失主要靠
         `_read_estimate_value` 的「数字右端贴裁框边界」告警来发现。
         """
-        normalized = raw_text.translate(FULLWIDTH_DIGITS)
+        normalized = raw_text.translate(FULLWIDTH_NUMERIC)
         digits_and_commas = re.sub(r"[^\d,]", "", normalized)
         if "," not in digits_and_commas:
             return False
@@ -2517,16 +2452,13 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         return None
 
     def _raise_mode(self) -> str:
-        """读取加价方式, 把旧版取值「倍数」归一到「倍率」。
+        """读取加价方式, 无效值按默认「倍率」处理。
 
-        迁移会在加载时改写配置, 这里再兜一次: 配置文件读不到或用户手改回旧取值时,
-        不能让判定串失配 —— 失配会静默落到「自定义」分支, 算出完全不同的价格。
-        未知取值保持原有的兜底语义(按自定义处理), 不在这里改行为。
+        配置迁移已全部删除。旧配置或手工编辑留下的无效取值不能静默落到「自定义」分支,
+        否则同一份价格配置会从指数增长变成线性增长, 所以直接回退到默认方式。
         """
         mode = self.config.get(self.CONF_RAISE_MODE, self.RAISE_MODE_MULTIPLE)
-        if mode == self.LEGACY_RAISE_MODE_MULTIPLE:
-            return self.RAISE_MODE_MULTIPLE
-        return mode
+        return mode if mode in self.RAISE_MODES else self.RAISE_MODE_MULTIPLE
 
     def _raise_price(self, base_price: int, bid_count: int) -> int:
         """按配置的加价方式计算第 bid_count 次出价的价格。
@@ -2746,9 +2678,16 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
                 return False
             self._bounded_sleep(deadline, 0.5)
 
+            # 弹窗已经打开了, 顺手把「今日已领取次数：N/5」读回来: 这是「今日低保是否
+            # 领完」的唯一权威读数, 也是轮次末尾要不要追加出售的依据。
+            self._read_welfare_counter(boxes, deadline)
+
             if self._wait_click_optional(boxes.claim, RE_CLAIM, deadline, 5, "领取按钮"):
                 self._bounded_sleep(deadline, 0.5)
                 self.log_info("已点击领取按钮")
+                # 本地 +1 只是为了在弹窗不再打开(资产高于阈值)时也能知道次数;
+                # 下次读数会整体覆盖, 所以这里多记一次是可自愈的。
+                self._welfare_claims_today += 1
             else:
                 self.log_info("未检测到领取按钮(今日次数可能已用尽), 直接关闭低保金弹窗")
 
@@ -2801,6 +2740,72 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         self.log_warning("低保金弹窗多次尝试后仍未关闭")
         return False
 
+    # --- 低保金领取记录 (决定追加出售是否放开) ---
+    def _read_welfare_counter(self, boxes: AuctionBoxes, deadline: float | None = None) -> None:
+        """读弹窗正文的「今日已领取次数：N/5」, 刷新当日已领次数与上限。
+
+        弹窗只在领取流程里打开, 所以这次读数不额外花时间。
+
+        读数**整体覆盖**本地累计值(而不是取较大者): 弹窗是权威来源, 覆盖能让
+        「本地多记了一次」在下次读数时自愈。读不出时保持原值 —— 「今日已领完」
+        是放开出售的开关, 读不到就必须保守。
+
+        用 `self.ocr(match=None)` 拿区域内全部文本, 而不是 `wait_ocr(match=...)`:
+        后者按 match 过滤返回值。实测这两张截图上「标签 + 数值」被识别成同一个框,
+        两种取法等价; 但检测模型把两者拆成两框时, 过滤会把标签丢掉, 只剩 "0/5"
+        没有可解析的整行 —— 固定用 match=None 拼回整行, 不赌识别粒度。
+
+        换帧重读一次而不是只读一帧: 弹窗淡入途中那一帧可能是空白, 而这次读数一旦
+        落空, 资产涨过 10 万后弹窗就不再打开, 当天再也读不到(阶段永远停在「未领完」,
+        追加出售静默失效)。多花 0.3 秒换掉这个静默失效是划算的。
+        """
+        found = None
+        for attempt in range(1, self.WELFARE_COUNTER_READS + 1):
+            texts = [box.name for box in self.ocr(box=boxes.welfare_counter, match=None)]
+            found = RE_WELFARE_COUNTER.search("".join(texts).translate(FULLWIDTH_NUMERIC))
+            if found is not None:
+                break
+            if attempt < self.WELFARE_COUNTER_READS:
+                self.next_frame()
+                self._bounded_sleep(deadline, self.WELFARE_COUNTER_RETRY_GAP)
+
+        if found is None:
+            self.log_debug("低保金领取次数读数失败, 保持上次记录")
+            return
+
+        self._welfare_claims_today = int(found.group(1))
+        self._welfare_daily_limit = int(found.group(2))
+        self.log_info(
+            f"今日已领取低保 {self._welfare_claims_today}/{self._welfare_daily_limit} 次"
+        )
+
+    def _welfare_quota_exhausted(self) -> bool:
+        """今日低保次数是否已用尽(今天再也领不到了)。
+
+        没读到过弹窗读数时一律返回 False。两个方向的代价不对称: 判成「没领完」只是
+        少卖几件藏品; 判成「领完了」却会在还能领低保的时候追加出售, 把资产抬过
+        10 万线, 低保就领不到了 —— 所以拿不准时往保守方向兜。
+        """
+        if self._welfare_daily_limit is None:
+            return False
+        return self._welfare_claims_today >= self._welfare_daily_limit
+
+    def _rollover_welfare_day(self) -> None:
+        """跨过游戏每日刷新时刻时清空当日低保领取记录。
+
+        按 5 点切分而不是自然日午夜: 游戏每日刷新在 5 点(与 src/config.py 的
+        「Monthly Card Time」默认值、BaseNTETask 算 next_monthly_card_start 用的
+        是同一个小时)。按午夜切会让 0~5 点这段被当成新的一天, 方向是「以为还能领 →
+        不追加出售」, 虽然保守, 但会让这几轮白等一次弹窗读数。
+        """
+        day = (datetime.now() - timedelta(hours=self.WELFARE_RESET_HOUR)).date()
+        if self._welfare_day == day:
+            return
+
+        self._welfare_day = day
+        self._welfare_claims_today = 0
+        self._welfare_daily_limit = None
+
     def _wait_click_optional(
         self,
         box: Box,
@@ -2842,20 +2847,6 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         return True
 
     # --- 藏品出售 ---
-    def _extra_sell_qualities(self, state: PostRoundState) -> list[str]:
-        """满仓或成功领取低保金时, 追加出售配置的品质。
-
-        这些品质会覆盖「保留藏品品质」, 用于在满仓或领完低保后清掉占用仓位的藏品。
-        """
-        if not (state.inventory_full or state.welfare_claimed):
-            return []
-
-        _, qualities = self._quality_selection()
-        selected = [name for name in qualities if name in self.QUALITY_KEYS]
-        if selected:
-            self.log_info("满足出售条件, 追加出售品质: " + ", ".join(selected))
-        return selected
-
     def _sell_collections_on_interval(
         self,
         boxes: AuctionBoxes,
@@ -2906,7 +2897,7 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         self._sell_collections_with_escalation(
             boxes,
             deadline,
-            self._extra_sell_qualities(state),
+            self._sell_qualities(),
             inventory_full=bool(inventory_full),
         )
 
@@ -2914,11 +2905,13 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         self,
         boxes: AuctionBoxes,
         deadline: float | None = None,
-        extra_sell: list[str] | tuple[str, ...] = (),
+        sell_qualities: list[str] | tuple[str, ...] = (),
         *,
         require_sale: bool = False,
     ) -> bool:
         """尝试出售藏品, deadline 为空时保持定期清理分支的原有行为。
+
+        sell_qualities 是本次要卖掉的品质清单(由调用方按低保阶段算好), 勾选即出售。
 
         require_sale 表示本次出售必须真的清掉藏品(满仓时无法继续出价)。此时「一个品质
         都没勾上」不能再算成功 —— 那会把满仓标记清掉, 之后每轮出价都失败却不再重试清理。
@@ -2958,9 +2951,9 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
                 self.operate_click(boxes.sell, after_sleep=0)
                 self._bounded_sleep(deadline, 1)
 
-            selected = self._select_quality_filters(deadline, extra_sell)
+            selected = self._select_quality_filters(deadline, sell_qualities)
             # 残留勾选会让这一遍无条件点击全部取反, _ensure_sell_value 读到 0 时会重勾一次兜住.
-            sell_value = self._ensure_sell_value(boxes, deadline, selected, extra_sell)
+            sell_value = self._ensure_sell_value(boxes, deadline, selected, sell_qualities)
             # 只有读到正数才算勾选生效: 读到 0 或读不出(界面重绘中的空白态)都不能算成功,
             # 否则会在毫无证据的情况下打印「藏品出售完成」, 掩盖「一个品质都没勾上」.
             selection_ok = self._is_selection_confirmed(
@@ -3059,14 +3052,14 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         self,
         boxes: AuctionBoxes,
         deadline: float | None,
-        extra_sell: list[str] | tuple[str, ...],
+        sell_qualities: list[str] | tuple[str, ...],
         *,
         inventory_full: bool,
     ) -> bool:
-        """执行藏品出售, 连续失败且满仓时放宽保留品质再试一次。
+        """执行藏品出售, 连续失败且满仓时放宽出售清单再试一次。
 
-        满仓卖不掉会让后续出价全部失败, 所以连续失败后优先把仓库腾空,
-        不再保留配置里指定的品质。成功一次就清零计数。
+        满仓卖不掉会让后续出价全部失败, 所以连续失败后优先把仓库腾空 —— 6 个品质
+        全部出售, 不再按低保阶段挑选。成功一次就清零计数。
 
         非满仓的失败多半是界面重绘导致的读数抖动, 此时放宽会白白卖掉用户明确要
         保留的品质, 而收益为零 —— 所以只在满仓时放宽, **也只在满仓失败时累积计数**。
@@ -3086,18 +3079,18 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         计数达到阈值后以放宽集合开局(use_escalated): 否则第一次调用就超时的话,
         放宽分支永远走不到。
         """
-        escalated = sorted(set(extra_sell) | set(self.QUALITY_KEYS))
+        escalated = sorted(set(sell_qualities) | set(self.QUALITY_KEYS))
         # 已经达到放宽阈值时直接用放宽集合开局: 满仓耗尽 SELL_TIMEOUT 会让第一次调用就抛
         # 异常, 永远走不到下面的放宽分支, 计数累到阈值也没有用.
         use_escalated = inventory_full and self._sell_failures >= self.SELL_FAILURE_ESCALATE_AFTER
         if use_escalated:
-            self.log_warning(f"藏品出售已连续 {self._sell_failures} 次未完成, 直接放宽保留品质")
+            self.log_warning(f"藏品出售已连续 {self._sell_failures} 次未完成, 直接放宽出售清单")
 
         try:
             sold = self._sell_collections(
                 boxes,
                 deadline,
-                escalated if use_escalated else extra_sell,
+                escalated if use_escalated else sell_qualities,
                 require_sale=inventory_full,
             )
         except WaitFailedException as e:
@@ -3124,7 +3117,7 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
             self._inventory_stuck = inventory_full
             return False
 
-        self.log_warning(f"藏品出售连续 {self._sell_failures} 次未完成, 放宽保留品质重试一次")
+        self.log_warning(f"藏品出售连续 {self._sell_failures} 次未完成, 放宽出售清单重试一次")
         try:
             escalated_sold = self._sell_collections(
                 boxes, deadline, escalated, require_sale=True
@@ -3132,46 +3125,39 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         except WaitFailedException as e:
             # 同上一处: 放宽后的这次出售是否生效同样无法确认, 保持计数与 _inventory_stuck
             # 不变, 交给下一轮的实测结论决定.
-            self.log_warning(f"放宽保留品质后的出售超出预算, 结果未知: {e}")
+            self.log_warning(f"放宽出售清单后的出售超出预算, 结果未知: {e}")
             raise
         if escalated_sold:
-            self.log_info("放宽保留品质后出售成功")
+            self.log_info("放宽出售清单后出售成功")
             self._sell_failures = 0
             self._inventory_stuck = False
             return True
 
-        self.log_warning("放宽保留品质后出售仍未成功, 满仓会导致后续出价失败")
+        self.log_warning("放宽出售清单后出售仍未成功, 满仓会导致后续出价失败")
         self._inventory_stuck = inventory_full
         return False
 
     def _select_quality_filters(
         self,
         deadline: float | None,
-        extra_sell: list[str] | tuple[str, ...] = (),
+        sell_qualities: list[str] | tuple[str, ...] = (),
     ) -> int:
-        """勾选需要出售的品质按钮, 跳过配置中保留的品质, 返回实际点击次数。
+        """勾选要出售的品质按钮, 返回实际点击次数。
 
-        extra_sell 中的品质即使被配置保留也会出售, 用于满仓或领完低保后的追加清理。
+        勾选即出售: sell_qualities 里的品质点选, 其余一律保留。清单由调用方按当日低保
+        阶段算好(见 _sell_qualities), 这里不再读配置。
 
         本方法是「无条件点击」: 对同一个品质调用两次会把刚勾上的状态点掉。所以它只在
         进入出售模式后调用一次, 校验读数时不能靠再调一次来重试(那是双重取反)。
         """
-        keep = set(self._quality_selection()[0])
-        extra = set(extra_sell)
+        sell = set(sell_qualities)
         clicked = 0
 
         for quality_name, quality_pos in zip(self.QUALITY_KEYS, self.QUALITY_BOXES):
-            # 只有「本来要保留、这次被追加出售」的品质才值得单独说一句. 其余品质本来就会
-            # 出售, 在那里报「追加」会让日志与行为不符 —— 用户会以为配置起了作用.
-            overridden = quality_name in extra and quality_name in keep
-            if quality_name in keep and not overridden:
+            if quality_name not in sell:
                 self.log_info(f"保留{quality_name}")
                 continue
-            if overridden:
-                self.log_info(f"条件触发, 追加出售{quality_name}")
-            else:
-                self.log_info(f"选择{quality_name}")
-
+            self.log_info(f"选择{quality_name}")
             self.operate_click(self.box_of_screen(*quality_pos), after_sleep=0)
             self._bounded_sleep(deadline, self.SELL_QUALITY_GAP)
             clicked += 1
@@ -3199,9 +3185,11 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         boxes: AuctionBoxes,
         deadline: float | None,
         selected: int,
-        extra_sell: list[str] | tuple[str, ...] = (),
+        sell_qualities: list[str] | tuple[str, ...] = (),
     ) -> int | None:
         """校验品质勾选是否真的生效: 读数没到位时先换帧重读, 仍是 0 才重勾一次。
+
+        sell_qualities 与首次勾选用的是同一批品质, 重勾必须原样传回去。
 
         品质圆点每点一次界面都会重绘, 间隔太短时后续点击会落空, 表现为只卖掉一种品质,
         而流程依旧会点确认出售并报告成功。这里读「出售价值」来验证: 读到正数说明生效。
@@ -3248,7 +3236,7 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
             # 若本来就是干净的初始视图(目标品质都没藏品), 重勾得到空集, 与不重勾
             # 的结果一样(都卖不掉), 不会更糟; 无限重试没有意义.
             self.log_warning("换帧重读后出售价值仍为 0, 按残留勾选被点掉处理, 重新勾选一次")
-            self._select_quality_filters(deadline, extra_sell)
+            self._select_quality_filters(deadline, sell_qualities)
             value = self._read_sell_value(
                 boxes, self._bounded_timeout(deadline, self.SELL_VALUE_TIMEOUT)
             )
