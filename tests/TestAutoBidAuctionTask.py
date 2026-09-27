@@ -3327,16 +3327,25 @@ class TestAuctionTimeoutConstants(unittest.TestCase):
     }
 
     def _bare_timeout_calls(self) -> list[tuple[int, str]]:
-        """扫描源码, 返回所有以裸数字作超时的调用点 (行号, 数字文本)。"""
-        source = Path(auction_module.__file__).read_text(encoding="utf-8")
+        """扫描拍卖域源码, 返回所有以裸数字作超时的调用点 (行号, 数字文本)。
+
+        出售等能力已按模块拆分到 src/tasks/auction/ 子包, 扫描必须覆盖整个拍卖域,
+        否则搬迁出去的调用点会逃过检查, 白名单对应的约束就只剩半边。
+        """
+        paths = [Path(auction_module.__file__)]
+        package_dir = Path(auction_module.__file__).parent / "auction"
+        if package_dir.is_dir():
+            paths.extend(sorted(package_dir.glob("*.py")))
         pattern = re.compile(
             r"(?:_remaining_timeout|_bounded_timeout|_timeout_or_zero)\(deadline,\s*([0-9.]+)\s*\)"
         )
         found = []
-        for index, line in enumerate(source.splitlines(), start=1):
-            match = pattern.search(line)
-            if match:
-                found.append((index, match.group(1)))
+        for path in paths:
+            source = path.read_text(encoding="utf-8")
+            for index, line in enumerate(source.splitlines(), start=1):
+                match = pattern.search(line)
+                if match:
+                    found.append((index, match.group(1)))
         return found
 
     def test_timeout_calls_use_named_constants(self):
