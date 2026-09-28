@@ -13,6 +13,9 @@ from src.tasks.auction import recovery as auction_recovery
 from src.tasks.auction import sell as auction_sell
 from src.tasks.auction import welfare as auction_welfare
 from src.tasks.auction.layout import (
+    EMOTE_BTN,
+    EMOTE_FIRST,
+    PAD_MAP,
     RE_BID,
     RE_BID_CONFIRM,
     RE_BID_PANEL,
@@ -28,23 +31,34 @@ from src.tasks.auction.layout import (
     AuctionState,
     PostRoundState,
 )
-from src.tasks.auction.layout import (
-    RE_CANCEL as RE_CANCEL,
+from src.tasks.auction.options import (
+    ASSIST_EMOTE,
+    BID_MODE_CUSTOM,
+    BID_MODE_ESTIMATE,
+    BID_MODE_LIST,
+    CONF_ASSIST_FEATURES,
+    CONF_AUTO_RAISE,
+    CONF_BID_MODE,
+    CONF_BID_PRICES,
+    CONF_ESTIMATE_RATIO,
+    CONF_FIXED_PRICE,
+    CONF_RAISE_MODE,
+    CONF_RAISE_ROUND,
+    CONF_RAISE_VALUE,
+    CONF_SELL_AFTER_WELFARE,
+    CONF_SELL_BEFORE_WELFARE,
+    CONF_SELL_MODE,
+    CONF_SPECIAL_ROUND,
+    CONF_SPECIAL_ROUND_PRICE,
+    CONF_SPECIAL_ROUNDS,
+    INST,
+    QUALITY_KEYS,
+    RAISE_MODE_MULTIPLE,
+    RAISE_MODES,
+    SELL_MODE_OFF,
+    SELL_MODE_ONE_CLICK,
+    SELL_QUALITY_KEYS,
 )
-from src.tasks.auction.layout import (
-    RE_CLAIM as RE_CLAIM,
-)
-from src.tasks.auction.layout import (
-    # 测试从本模块导入这五个正则; 使用方已迁至 auction 子包, 此处显式再导出。
-    RE_ONE_CLICK_SELL as RE_ONE_CLICK_SELL,
-)
-from src.tasks.auction.layout import (
-    RE_POPUP_CLOSE_HINT as RE_POPUP_CLOSE_HINT,
-)
-from src.tasks.auction.layout import (
-    RE_WELFARE_COUNTER as RE_WELFARE_COUNTER,
-)
-from src.tasks.auction.options import INST
 from src.tasks.BaseNTETask import BaseNTETask
 from src.tasks.NTEOneTimeTask import NTEOneTimeTask
 
@@ -54,105 +68,11 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
 
     功能包括: 匹配, 确认, 出价, 出价重试, 结算, 低保金领取, 表情包发送, 藏品出售。
     需要在拍卖主界面选择低级会场后开始执行。
+
+    配置键 / UI 区域 / 纯函数的唯一来源在 `src/tasks/auction/` 子包
+    (options / layout / price), 本类直接按名导入使用, 不再保留类级别名;
+    出售 / 低保 / 回场的行为常量定义在各自的子包模块里。
     """
-
-    # --- 拍卖配置 (兼容别名) ---
-    # 常量唯一来源: src/tasks/auction/options.py; 默认配置/控件类型/说明由
-    # auction_options.default_config() / config_type() / config_description() 装配。
-    # 方法与测试仍按 self.<名字> / AutoBidAuctionTask.<名字> 访问, 等消费者全部
-    # 迁到 auction 包后再逐个收掉。
-    CONF_FIXED_PRICE = auction_options.CONF_FIXED_PRICE
-    CONF_SELL_MODE = auction_options.CONF_SELL_MODE
-    SELL_MODE_OFF = auction_options.SELL_MODE_OFF
-    SELL_MODE_FULL = auction_options.SELL_MODE_FULL
-    SELL_MODE_ONE_CLICK = auction_options.SELL_MODE_ONE_CLICK
-    SELL_MODE_INTERVAL = auction_options.SELL_MODE_INTERVAL
-    SELL_MODES = auction_options.SELL_MODES
-    CONF_SELL_INTERVAL = auction_options.CONF_SELL_INTERVAL
-    CONF_SELL_BEFORE_WELFARE = auction_options.CONF_SELL_BEFORE_WELFARE
-    CONF_SELL_AFTER_WELFARE = auction_options.CONF_SELL_AFTER_WELFARE
-    SELL_QUALITY_KEYS = auction_options.SELL_QUALITY_KEYS
-    CONF_AUTO_RAISE = auction_options.CONF_AUTO_RAISE
-    CONF_RAISE_MODE = auction_options.CONF_RAISE_MODE
-    RAISE_MODE_MULTIPLE = auction_options.RAISE_MODE_MULTIPLE
-    RAISE_MODE_CUSTOM = auction_options.RAISE_MODE_CUSTOM
-    RAISE_MODE_PERCENT = auction_options.RAISE_MODE_PERCENT
-    RAISE_MODES = auction_options.RAISE_MODES
-    CONF_RAISE_VALUE = auction_options.CONF_RAISE_VALUE
-    CONF_RAISE_ROUND = auction_options.CONF_RAISE_ROUND
-    CONF_SPECIAL_ROUND = auction_options.CONF_SPECIAL_ROUND
-    CONF_SPECIAL_ROUNDS = auction_options.CONF_SPECIAL_ROUNDS
-    CONF_SPECIAL_ROUND_PRICE = auction_options.CONF_SPECIAL_ROUND_PRICE
-    CONF_BID_MODE = auction_options.CONF_BID_MODE
-    BID_MODE_CUSTOM = auction_options.BID_MODE_CUSTOM
-    BID_MODE_LIST = auction_options.BID_MODE_LIST
-    BID_MODE_ESTIMATE = auction_options.BID_MODE_ESTIMATE
-    CONF_ESTIMATE_RATIO = auction_options.CONF_ESTIMATE_RATIO
-    MAX_BID_ROUNDS = auction_options.MAX_BID_ROUNDS
-    CONF_BID_PRICES = auction_options.CONF_BID_PRICES
-    CONF_ASSIST_FEATURES = auction_options.CONF_ASSIST_FEATURES
-    ASSIST_EMOTE = auction_options.ASSIST_EMOTE
-    ASSIST_WELFARE = auction_options.ASSIST_WELFARE
-    ASSIST_FEATURES = auction_options.ASSIST_FEATURES
-    QUALITY_KEYS = auction_options.QUALITY_KEYS
-    SPECIAL_ROUND_OPTIONS = auction_options.SPECIAL_ROUND_OPTIONS
-
-    # --- UI 坐标 (兼容别名) ---
-    # 区域常量唯一来源: src/tasks/auction/layout.py (含 AuctionBoxes 与 OCR 正则),
-    # 数值零改动, 注释随迁。消费者全部迁移后逐个收掉。
-    BOX_MATCH = auction_layout.BOX_MATCH
-    BOX_CONFIRM = auction_layout.BOX_CONFIRM
-    BOX_BID = auction_layout.BOX_BID
-    BOX_BID_KEYPAD = auction_layout.BOX_BID_KEYPAD
-    BOX_SKIP_AREA = auction_layout.BOX_SKIP_AREA
-    BOX_EXIT = auction_layout.BOX_EXIT
-    BOX_BID_CONFIRM = auction_layout.BOX_BID_CONFIRM
-    BOX_ABANDON = auction_layout.BOX_ABANDON
-    BOX_ABANDON_CONFIRM = auction_layout.BOX_ABANDON_CONFIRM
-    BOX_ASSET_VALUE = auction_layout.BOX_ASSET_VALUE
-    BOX_ESTIMATE = auction_layout.BOX_ESTIMATE
-    BOX_LAST_BID = auction_layout.BOX_LAST_BID
-    BOX_CLEAR = auction_layout.BOX_CLEAR
-    BOX_PRICE_RESULT = auction_layout.BOX_PRICE_RESULT
-    BOX_PRICE_RESULT_KEYPAD = auction_layout.BOX_PRICE_RESULT_KEYPAD
-    BOX_EXCEPTION_AREA = auction_layout.BOX_EXCEPTION_AREA
-    BOX_MAIN_TITLE = auction_layout.BOX_MAIN_TITLE
-    BOX_MAIN_ASSET = auction_layout.BOX_MAIN_ASSET
-    BOX_INSUFFICIENT = auction_layout.BOX_INSUFFICIENT
-    POS_CITY_FUN_SCROLL = auction_layout.POS_CITY_FUN_SCROLL
-    BOX_CITY_FUN_TITLE = auction_layout.BOX_CITY_FUN_TITLE
-    BOX_CITY_FUN_CARDS = auction_layout.BOX_CITY_FUN_CARDS
-    BOX_CURRENT_VENUE = auction_layout.BOX_CURRENT_VENUE
-    BOX_WELFARE_BTN = auction_layout.BOX_WELFARE_BTN
-    BOX_WELFARE_DIALOG = auction_layout.BOX_WELFARE_DIALOG
-    BOX_WELFARE_COUNTER = auction_layout.BOX_WELFARE_COUNTER
-    BOX_CLAIM = auction_layout.BOX_CLAIM
-    BOX_CANCEL = auction_layout.BOX_CANCEL
-    BOX_WAREHOUSE_BTN = auction_layout.BOX_WAREHOUSE_BTN
-    BOX_WAREHOUSE_TITLE = auction_layout.BOX_WAREHOUSE_TITLE
-    BOX_SELL = auction_layout.BOX_SELL
-    BOX_CONFIRM_SELL = auction_layout.BOX_CONFIRM_SELL
-    BOX_BLANK = auction_layout.BOX_BLANK
-    BOX_CLOSE = auction_layout.BOX_CLOSE
-    BOX_SELL_LABEL = auction_layout.BOX_SELL_LABEL
-    BOX_SELL_VALUE = auction_layout.BOX_SELL_VALUE
-    BOX_ONE_CLICK_SELL = auction_layout.BOX_ONE_CLICK_SELL
-    BOX_POPUP_CLOSE_HINT = auction_layout.BOX_POPUP_CLOSE_HINT
-    BOX_POPUP_BLANK = auction_layout.BOX_POPUP_BLANK
-    QUALITY_BOXES = auction_layout.QUALITY_BOXES
-    PAD_MAP = auction_layout.PAD_MAP
-    EMOTE_BTN = auction_layout.EMOTE_BTN
-    EMOTE_FIRST = auction_layout.EMOTE_FIRST
-
-    # 品质圆点每点击一次界面会重绘, 间隔太短时后续点击会落空;
-    # 勾选后读出售价值校验, 读到 0 或读不出时换帧重读, 最多尝试 SELL_SELECT_RETRIES 次.
-    # 不能靠重新勾选来重试: 勾选是无条件点击, 再点一次会把刚勾上的品质全部点掉.
-    SELL_QUALITY_GAP = 0.5
-    SELL_SELECT_RETRIES = 2
-
-    # 「出售价值」在品质圆点刚点完时会短暂变成空白(界面重绘), 只给 1 秒经常读空;
-    # 读不出时返回 None, 调用方必须按「未确认」处理, 不能当成出售成功.
-    SELL_VALUE_TIMEOUT = 3
 
     # 提示类弹窗(入场费确认 / 异常出价 / 满仓提示)共用一套模板: 标题「提示」在
     # 屏幕中部, 确认与取消按钮在底部同一组坐标. 因此一个区域就能兜住这一类弹窗.
@@ -161,28 +81,10 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
     # 每次出价都要查一遍弹窗, 预算调小: 漏掉一次弹窗要赔上整轮, 但不该固定白等 2 秒.
     BID_NOTICE_POPUP_TIMEOUT = 1.0
 
-    # 库存不足提示条出现时机不定, 给 1 秒容易漏掉(漏掉就不会提前清理, 满仓会卡住).
-    INVENTORY_FULL_TIMEOUT = 3
-
-    # 出售连续失败到这个次数后放宽出售清单(6 个品质全卖)再试一次: 满仓卖不掉会让后续
-    # 出价全部失败, 这时候把仓库腾空的优先级高于按低保阶段挑选品质.
-    SELL_FAILURE_ESCALATE_AFTER = 2
-
     # 轮次末尾出售流程的总预算。出售是收尾动作, 不该像拍卖阶段那样吃掉整轮 600 秒:
     # 逐分支等待下限约 35 秒, 连续失败放宽再走一趟约 71 秒, 留一倍余量。
+    # 这是任务侧授予出售流程的预算; 出售域自己的常量见 auction_sell。
     SELL_TIMEOUT = 90
-
-    # 关闭藏品仓库的重试次数。批量关闭失败会把「出售模式 + 已勾选品质」留给下一轮,
-    # 下次进来会无条件再点一遍同一批品质(全部取反), 必须确认真的关掉了。
-    WAREHOUSE_CLOSE_RETRIES = 3
-    # 藏品仓库入口与界面标题的等待上限。两者是同一段 UI 就绪过程(点入口 → 界面加载),
-    # 用同一个上限, 免得调一处漏一处。
-    WAREHOUSE_LOAD_TIMEOUT = 10
-
-    # 结算界面的「一键出售」: 跳过动画刚点完, 按钮本来就该在, 给短超时即可.
-    ONE_CLICK_SELL_TIMEOUT = 3
-    # 点完一键出售要等服务端返回才弹出「获得物品」提示条, 给足时间.
-    POPUP_CLOSE_TIMEOUT = 5
 
     # --- 阶段超时 (秒) ---
     # 单轮拍卖的硬上限, 防止各阶段局部超时叠加后长期卡住任务.
@@ -203,8 +105,6 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
     # 结算画面存在跳过动画已出现而退出按钮尚未渲染的中间态, 等待不能太短.
     EXIT_BUTTON_TIMEOUT = 10
     ASSET_OCR_TIMEOUT = 15
-    # 主界面资产观测的单次超时。观测每轮都要做, 给太长会拖累单轮总预算。
-    ASSET_OBSERVE_TIMEOUT = 5
     # 出价面板的当前估价在界面刚出现时会跳动几次, 第一次识别到的不是最终值;
     # 连续读到相同值才采用, 最多等 ESTIMATE_STABLE_TIMEOUT 秒.
     ESTIMATE_STABLE_READS = 3
@@ -234,37 +134,6 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
     RESULT_MAX_LOOPS = 180
     BID_MAX_RETRIES = 3
 
-    # 资产低于该值时领取低保金.
-    WELFARE_ASSET_THRESHOLD = 100000
-
-    # 低保金弹窗关闭重试次数, 每日次数用尽时弹窗没有领取按钮, 只能靠取消关闭.
-    WELFARE_CLOSE_RETRIES = 3
-
-    # 低保金每日刷新时刻(游戏每日 5 点重置, 与 src/config.py 的「Monthly Card Time」默认值一致)。
-    # 只用于跨天清空当日领取记录; 具体次数与上限一律以弹窗读数「今日已领取次数：N/5」为准,
-    # 所以这里不写死「每日 5 次」—— 游戏改上限时不需要跟着改代码。
-    WELFARE_RESET_HOUR = 5
-    # 弹窗次数读数最多读几帧、换帧间隔多少秒。只读一帧时弹窗淡入中的空白帧会让这次
-    # 读数落空, 而资产涨过 10 万后弹窗不再打开, 当天就再也读不到了(追加出售静默失效)。
-    WELFARE_COUNTER_READS = 2
-    WELFARE_COUNTER_RETRY_GAP = 0.3
-
-    # --- 掉线回场 (秒/次) ---
-    # 网络不稳时匹配阶段会被踢回大世界, 界面状态全不命中, 只能空转到 MATCH_TIMEOUT。
-    # 回场是一次性的异常路径: 失败就按本轮失败处理, 交给下一轮重试。
-    RECOVER_TIMEOUT = 90  # 单次回场总预算
-    RECOVER_STEP_TIMEOUT = 12  # 回场各步骤的等待上限
-    RECOVER_SCROLL_STEPS = 4  # 「都市闲趣」面板最多滚动几次去找「即刻落槌」
-    RECOVER_SCROLL_WHEEL = -8  # 每次滚动的滚轮格数
-    # 单轮回场次数上限, 由 _exec_auction_round 写进 self._recover_quota 并扣减。
-    # 挂在轮次而不是调用参数上的原因见 _exec_auction_round: 参数会在「确认失败后重跑
-    # _stage_match」的路径上被默认值恢复, 使同一轮可以反复回场, 每次都重走一遍面板动画
-    # 把整轮 deadline 耗光, 并且让「本轮只回场一次」这个约定形同虚设。
-    RECOVER_MAX_PER_ROUND = 1
-    # 启动时的入口回场(见 _ensure_auction_entry): 探测主界面标题的等待上限,
-    # 以及一次性回场预算。预算与 RECOVER_TIMEOUT 一致, 两者走的是同一条路径。
-    ENTRY_PROBE_TIMEOUT = 3
-    ENTRY_RECOVER_TIMEOUT = 90
     # 匹配阶段每 N 次轮询探一次大世界(约 2 秒): 判定要跑一次旋转模板匹配 + 一次血条模板
     # 匹配, 比 OCR 贵, 不能每 0.5 秒调一次; 探测只在点击「开始匹配」之后、界面迟迟不变化时
     # 才开始.
@@ -419,45 +288,8 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         return auction_recovery.read_current_venue(self)
 
     def _build_boxes(self) -> AuctionBoxes:
-        """按相对比例一次性构建本轮拍卖使用的全部 UI 区域。"""
-        screen = self.box_of_screen
-        return AuctionBoxes(
-            match=screen(*self.BOX_MATCH),
-            confirm=screen(*self.BOX_CONFIRM),
-            bid=screen(*self.BOX_BID),
-            bid_keypad=screen(*self.BOX_BID_KEYPAD),
-            skip_area=screen(*self.BOX_SKIP_AREA),
-            exit=screen(*self.BOX_EXIT),
-            bid_confirm=screen(*self.BOX_BID_CONFIRM),
-            abandon=screen(*self.BOX_ABANDON),
-            abandon_confirm=screen(*self.BOX_ABANDON_CONFIRM),
-            asset_value=screen(*self.BOX_ASSET_VALUE),
-            estimate=screen(*self.BOX_ESTIMATE),
-            last_bid=screen(*self.BOX_LAST_BID),
-            clear=screen(*self.BOX_CLEAR),
-            price_result=screen(*self.BOX_PRICE_RESULT),
-            price_result_keypad=screen(*self.BOX_PRICE_RESULT_KEYPAD),
-            exception_area=screen(*self.BOX_EXCEPTION_AREA),
-            main_title=screen(*self.BOX_MAIN_TITLE),
-            main_asset=screen(*self.BOX_MAIN_ASSET),
-            insufficient=screen(*self.BOX_INSUFFICIENT),
-            welfare_btn=screen(*self.BOX_WELFARE_BTN),
-            welfare_dialog=screen(*self.BOX_WELFARE_DIALOG),
-            welfare_counter=screen(*self.BOX_WELFARE_COUNTER),
-            claim=screen(*self.BOX_CLAIM),
-            cancel=screen(*self.BOX_CANCEL),
-            warehouse_btn=screen(*self.BOX_WAREHOUSE_BTN),
-            warehouse_title=screen(*self.BOX_WAREHOUSE_TITLE),
-            sell=screen(*self.BOX_SELL),
-            confirm_sell=screen(*self.BOX_CONFIRM_SELL),
-            sell_label=screen(*self.BOX_SELL_LABEL),
-            sell_value=screen(*self.BOX_SELL_VALUE),
-            blank=screen(*self.BOX_BLANK),
-            close=screen(*self.BOX_CLOSE),
-            one_click_sell=screen(*self.BOX_ONE_CLICK_SELL),
-            popup_close_hint=screen(*self.BOX_POPUP_CLOSE_HINT),
-            popup_blank=screen(*self.BOX_POPUP_BLANK),
-        )
+        """按相对比例一次性构建本轮拍卖使用的全部 UI 区域, 装配见 auction_layout.build_boxes。"""
+        return auction_layout.build_boxes(self.box_of_screen)
 
     # --- 任务入口回场 (大世界 → 拍卖主界面) ---
     def _ensure_auction_entry(self, boxes: AuctionBoxes) -> None:
@@ -531,7 +363,7 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         # 调 `_stage_match(boxes, deadline)`, 默认值 `True` 把配额悄悄恢复 —— 于是一轮里可以
         # 回场多次, 每次都要重走一遍「F5 → 都市闲趣 → 即刻落槌」的动画, 把整轮 deadline
         # 耗光。配额属于「这一轮」而不是「这一次匹配调用」, 所以只能挂在轮次上。
-        self._recover_quota = self.RECOVER_MAX_PER_ROUND
+        self._recover_quota = auction_recovery.RECOVER_MAX_PER_ROUND
         self.info_set("当前阶段", "匹配中")
         self.log_info(f"拍卖开始, 单轮最长运行 {self.ROUND_TIMEOUT} 秒")
         self.sleep(0.5)
@@ -660,7 +492,7 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         )
         if not clicked:
             return None
-        self.log_info("已点击开始匹配, 等待状态变化")
+        self.log_debug("已点击开始匹配, 等待状态变化")
 
         click_deadline = min(stage_deadline, time.monotonic() + self.MATCH_CLICK_TIMEOUT)
         probe_deadline = min(click_deadline, time.monotonic() + self.MATCH_PROBE_TIMEOUT)
@@ -734,13 +566,11 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         每次出价结果最多等待 BID_RESULT_TIMEOUT 秒, 整个阶段仍受单轮 deadline 约束。
         资产为 0 时放弃本次出价并等待拍卖结束, 放弃不计入出价序号。
         """
-        # 每轮拍卖开始前重置出价计数和上次价格.
         self.current_bid_count = 0
         self.last_bid_price = None
 
         retry = 0
-        # 循环只通过 return(拍卖结束) 或 raise(连续失败/超时) 退出, 所以用 while True.
-        # 出价失败一律抛异常, 连续失败达到 BID_MAX_RETRIES 时在 except 分支抛出.
+        # 循环只通过 return(拍卖结束) 或 raise(重试耗尽/超时) 退出, 没有 break 路径.
         while True:
             self._remaining_timeout(deadline, 0.1)
             try:
@@ -842,10 +672,10 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         # 出价按钮, 否则保持原有等待与点击路径.
         keypad_open = bool(self.ocr(box=boxes.bid_keypad, match=RE_BID_PANEL))
         if keypad_open:
-            self.log_info("数字面板已打开, 跳过出价按钮")
+            self.log_debug("数字面板已打开, 跳过出价按钮")
             found = True
         else:
-            self.log_info("等待出价按钮")
+            self.log_debug("等待出价按钮")
             found = self._wait_operate_click(
                 boxes.bid,
                 RE_BID,
@@ -855,7 +685,7 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
             self.log_warning("出价按钮未出现, 准备重试本次出价")
             raise WaitFailedException("出价按钮未出现")
 
-        self.log_info("点击出价")
+        self.log_debug("点击出价")
         panel_ready = self.wait_ocr(
             box=boxes.bid_confirm,
             match=RE_BID_PANEL_READY,
@@ -867,7 +697,7 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
             self.log_warning("数字面板未出现, 准备重试本次出价")
             raise WaitFailedException("数字面板未出现")
 
-        self.log_info("数字面板加载完成")
+        self.log_debug("数字面板加载完成")
         self._input_fixed_price(boxes, deadline=deadline)
 
         bid_confirmed = self.wait_until(
@@ -879,7 +709,7 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         if not bid_confirmed:
             raise WaitFailedException("出价确认失败: 出价按钮仍存在")
 
-        if self._assist_enabled(self.ASSIST_EMOTE):
+        if self._assist_enabled(ASSIST_EMOTE):
             self._send_emote()
 
         return True
@@ -937,7 +767,7 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         self.operate_click(skip_results, after_sleep=0.5)
 
         # 「拍卖成功一键出售」必须在退出拍卖之前完成: 一键出售按钮只在结算界面存在.
-        if self._sell_mode() == self.SELL_MODE_ONE_CLICK:
+        if self._sell_mode() == SELL_MODE_ONE_CLICK:
             self._sell_on_settlement_screen(boxes, deadline)
 
         exit_button = self._wait_operate_click(
@@ -977,11 +807,13 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
 
     def _run_post_round_actions(self, boxes: AuctionBoxes, deadline: float) -> None:
         """结算后的观测与低保领取编排, 执行顺序见 auction_welfare.run_post_round_actions。"""
-        auction_welfare.run_post_round_actions(self, boxes, deadline)
+        auction_welfare.run_post_round_actions(
+            self, boxes, deadline, inventory_full_timeout=auction_sell.INVENTORY_FULL_TIMEOUT
+        )
 
     def _sell_mode(self) -> str:
         """读取出售模式, 未知值按「不出售」处理, 规则见 auction_sell.normalize_mode。"""
-        return auction_sell.normalize_mode(self.config.get(self.CONF_SELL_MODE, self.SELL_MODE_OFF))
+        return auction_sell.normalize_mode(self.config.get(CONF_SELL_MODE, SELL_MODE_OFF))
 
     def _assist_enabled(self, feature: str) -> bool:
         """判断「启用辅助功能」多选框里是否勾选了某个功能。
@@ -990,7 +822,7 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         配置仍为旧 bool)时一律按未勾选处理: 少发一个表情、少领一次低保金都是可
         恢复的, 不该因为脏配置去点不存在的按钮。
         """
-        selected = self.config.get(self.CONF_ASSIST_FEATURES, ())
+        selected = self.config.get(CONF_ASSIST_FEATURES, ())
         if not isinstance(selected, list):
             return False
         return feature in selected
@@ -1139,7 +971,7 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         raw = self.config.get(key, [])
         if not isinstance(raw, (list, tuple)):
             return []
-        return [name for name in self.QUALITY_KEYS if name in raw]
+        return [name for name in QUALITY_KEYS if name in raw]
 
     def _sell_qualities(self) -> list[str]:
         """按当日低保阶段返回本轮要出售的品质清单。
@@ -1159,9 +991,7 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         6 个品质全卖, 见 _sell_collections_with_escalation)。
         """
         key = (
-            self.CONF_SELL_AFTER_WELFARE
-            if self._welfare_quota_exhausted()
-            else self.CONF_SELL_BEFORE_WELFARE
+            CONF_SELL_AFTER_WELFARE if self._welfare_quota_exhausted() else CONF_SELL_BEFORE_WELFARE
         )
         return self._quality_list(key)
 
@@ -1171,36 +1001,34 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         出价面板打开后才发现非法配置, 会以每轮 3 次重试的方式空转, 必须在入口拦截。
         校验范围随出价模式变化, 未使用的价格配置不参与校验。
         """
-        mode = self.config.get(self.CONF_BID_MODE, self.BID_MODE_CUSTOM)
+        mode = self.config.get(CONF_BID_MODE, BID_MODE_CUSTOM)
 
-        if mode == self.BID_MODE_LIST:
-            auction_price.validate_bid_prices(
-                [self._config_int(key, 0) for key in self.CONF_BID_PRICES]
-            )
+        if mode == BID_MODE_LIST:
+            auction_price.validate_bid_prices([self._config_int(key, 0) for key in CONF_BID_PRICES])
             return
 
-        if mode == self.BID_MODE_ESTIMATE:
-            ratio = self._config_float(self.CONF_ESTIMATE_RATIO, 0.0)
+        if mode == BID_MODE_ESTIMATE:
+            ratio = self._config_float(CONF_ESTIMATE_RATIO, 0.0)
             if not math.isfinite(ratio) or ratio <= 0:
                 raise ValueError(
-                    f"估价倍率必须为正数, 当前: {self.config.get(self.CONF_ESTIMATE_RATIO)!r}"
+                    f"估价倍率必须为正数, 当前: {self.config.get(CONF_ESTIMATE_RATIO)!r}"
                 )
             # 估价读不出时回退「基础价」出价, 非正整数会让那次出价因「非法价格」
             # 连续失败 3 次丢掉整轮。正常配置下不拦任务(估价可读时它根本用不到),
             # 只提前把后果说清楚。
             try:
-                fallback = int(self.config.get(self.CONF_FIXED_PRICE))
+                fallback = int(self.config.get(CONF_FIXED_PRICE))
             except (TypeError, ValueError):
                 fallback = 0
             if fallback <= 0:
                 self.log_warning(
-                    f"「{self.CONF_FIXED_PRICE}」不是正整数"
-                    f"({self.config.get(self.CONF_FIXED_PRICE)!r}), "
+                    f"「{CONF_FIXED_PRICE}」不是正整数"
+                    f"({self.config.get(CONF_FIXED_PRICE)!r}), "
                     "估价读不出时回退的出价将无法输入, 该次出价会失败"
                 )
             return
 
-        base_raw = self.config.get(self.CONF_FIXED_PRICE)
+        base_raw = self.config.get(CONF_FIXED_PRICE)
         try:
             base_price = int(base_raw)
         except (TypeError, ValueError):
@@ -1208,24 +1036,22 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         if base_price <= 0:
             raise ValueError(f"基础价必须为正整数, 当前: {base_raw!r}")
 
-        if self.config.get(self.CONF_AUTO_RAISE, False):
+        if self.config.get(CONF_AUTO_RAISE, False):
             # 校验必须与 _raise_price 同口径(_config_decimal 的 Decimal 解析): 若用
             # _config_float, 非法字符串会回退成 0.0 顺利通过, 运行时自定义/百分比
             # 模式拿着 0 静默按基础价出价, 用户完全无感.
             try:
-                raise_value = Decimal(str(self.config.get(self.CONF_RAISE_VALUE)))
+                raise_value = Decimal(str(self.config.get(CONF_RAISE_VALUE)))
             except (ArithmeticError, ValueError):
                 raise ValueError(
-                    f"加价数值配置非法: {self.config.get(self.CONF_RAISE_VALUE)!r}"
+                    f"加价数值配置非法: {self.config.get(CONF_RAISE_VALUE)!r}"
                 ) from None
             if not raise_value.is_finite():
-                raise ValueError(f"加价数值配置非法: {self.config.get(self.CONF_RAISE_VALUE)!r}")
+                raise ValueError(f"加价数值配置非法: {self.config.get(CONF_RAISE_VALUE)!r}")
             # 0 或负数会通过 is_finite, 运行时每口出价都触发回退告警(倍率模式偶数次
             # 偏移还会先爆出天文数字); 加价的语义就是往上加, 在入口一并拦下。
             if raise_value <= 0:
-                raise ValueError(
-                    f"加价数值必须为正数, 当前: {self.config.get(self.CONF_RAISE_VALUE)!r}"
-                )
+                raise ValueError(f"加价数值必须为正数, 当前: {self.config.get(CONF_RAISE_VALUE)!r}")
 
     def _warn_if_no_sellable_quality(self) -> None:
         """两个出售品质清单都为空时给出告警: 开了出售模式却没有可出售的品质。
@@ -1236,19 +1062,12 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         if not self._uses_collection_sell():
             return
 
-        if any(self._quality_list(key) for key in self.SELL_QUALITY_KEYS):
+        if any(self._quality_list(key) for key in SELL_QUALITY_KEYS):
             return
         self.log_warning(
-            f"「{self.CONF_SELL_BEFORE_WELFARE}」与「{self.CONF_SELL_AFTER_WELFARE}」"
+            f"「{CONF_SELL_BEFORE_WELFARE}」与「{CONF_SELL_AFTER_WELFARE}」"
             "都没有勾选品质, 本次运行不会清掉任何藏品"
         )
-
-    # --- 资产解析 (兼容别名) ---
-    # 纯函数唯一来源: src/tasks/auction/price.py; OCR 副作用与告警仍在任务侧协调,
-    # 测试继续按 AutoBidAuctionTask.<名字> 访问。
-    _parse_asset_value = staticmethod(auction_price.parse_asset_value)
-    _is_partial_number_text = staticmethod(auction_price.is_partial_number_text)
-    _has_inconsistent_grouping = staticmethod(auction_price.has_inconsistent_grouping)
 
     def _read_estimate_texts(self, box: Box, timeout: float) -> list:
         """读区域内**全部**文本, 不做 match 过滤。
@@ -1312,14 +1131,14 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
 
         digit_boxes = sorted(candidates, key=lambda b: b.x)
         raw_text = "".join(b.name for b in digit_boxes)
-        if self._is_partial_number_text(raw_text):
+        if auction_price.is_partial_number_text(raw_text):
             self.log_debug(f"{label} OCR: '{raw_text}', 千位分隔符前缺数字, 视为残缺读数")
             return None, False
-        if self._has_inconsistent_grouping(raw_text):
+        if auction_price.has_inconsistent_grouping(raw_text):
             self.log_debug(f"{label} OCR: '{raw_text}', 千位分组不自洽, 视为残缺读数")
             return None, False
 
-        value = self._parse_asset_value(raw_text)
+        value = auction_price.parse_asset_value(raw_text)
         right_edge = max(b.x + b.width for b in digit_boxes)
         # 阈值随分辨率等比放大, 至少 1px: 高 DPI 下框宽不变(本项目 resize_image 为默认 0,
         # 截图不重采样)时小于 1px 的判定没有意义.
@@ -1347,11 +1166,11 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
             return None
 
         raw_text = "".join(text_box.name for text_box in boxes)
-        if reject_partial and self._is_partial_number_text(raw_text):
+        if reject_partial and auction_price.is_partial_number_text(raw_text):
             self.log_debug(f"{label} OCR: '{raw_text}', 千位分隔符前缺数字, 视为残缺读数")
             return None
 
-        value = self._parse_asset_value(raw_text)
+        value = auction_price.parse_asset_value(raw_text)
         self.log_debug(f"{label} OCR: '{raw_text}', 解析值: {value}")
         return value
 
@@ -1370,20 +1189,20 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         出价序号从 1 开始计数, 基于成功出价次数 + 1。
         """
         bid_count = self.current_bid_count + 1
-        mode = self.config.get(self.CONF_BID_MODE, self.BID_MODE_CUSTOM)
+        mode = self.config.get(CONF_BID_MODE, BID_MODE_CUSTOM)
 
-        if mode == self.BID_MODE_LIST:
+        if mode == BID_MODE_LIST:
             return self._listed_bid_price(bid_count)
-        if mode == self.BID_MODE_ESTIMATE:
+        if mode == BID_MODE_ESTIMATE:
             return self._estimate_bid_price(boxes, deadline, bid_count)
 
-        base_price = self._config_int(self.CONF_FIXED_PRICE, 1)
+        base_price = self._config_int(CONF_FIXED_PRICE, 1)
 
         special_price = self._special_round_price(bid_count)
         if special_price is not None:
             return special_price
 
-        if not self.config.get(self.CONF_AUTO_RAISE, False):
+        if not self.config.get(CONF_AUTO_RAISE, False):
             return base_price
 
         return self._raise_price(base_price, bid_count)
@@ -1394,14 +1213,14 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         解析规则见 auction_price.resolve_bid_prices: 未设置(0)的回合沿用上一次
         已设置的价格, 第 1 次出价必须有价格, 否则返回空列表由调用方按配置错误处理。
         """
-        raw_prices = [self._config_int(key, 0) for key in self.CONF_BID_PRICES]
+        raw_prices = [self._config_int(key, 0) for key in CONF_BID_PRICES]
         return auction_price.resolve_bid_prices(raw_prices)
 
     def _listed_bid_price(self, bid_count: int) -> int:
         """按出价序号取每轮指定价格, 出价次数超出配置项时沿用最后一次的价格。"""
         prices = self._resolve_bid_prices()
         if not prices:
-            raise ValueError(f"每轮指定价格未配置: {self.CONF_BID_PRICES[0]} 必须大于 0")
+            raise ValueError(f"每轮指定价格未配置: {CONF_BID_PRICES[0]} 必须大于 0")
 
         index = min(max(bid_count, 1), len(prices)) - 1
         price = prices[index]
@@ -1543,14 +1362,14 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
                 self.log_warning(
                     f"{label}观测期间出现过贴边读数, 该值可能不完整; "
                     f"若与实际不符, 请检查 "
-                    f"{self.__class__.__name__}.BOX_ESTIMATE 右边界"
+                    f"auction_layout.BOX_ESTIMATE 右边界"
                 )
         elif tight_seen:
             # last 为空只有两种成因: 从头到尾没读到, 或读到之后又被贴边帧作废.
             # 后者才是要提示用户去调裁框的情形, 文案要能同时覆盖.
             self.log_warning(
                 f"{label}读数贴住识别区域边界(或其后读数不可信), 末位可能被裁掉, "
-                f"视为未读出; 请检查 {self.__class__.__name__}.BOX_ESTIMATE 右边界"
+                f"视为未读出; 请检查 auction_layout.BOX_ESTIMATE 右边界"
             )
         elif zero_seen:
             self.log_warning(f"{label}在 {timeout} 秒内只读到 0, 视为未读出")
@@ -1566,7 +1385,7 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         面板在滚出数字前会先显示 0, 所以用 skip_zero 把 0 当占位读数继续等,
         否则 0 会被 `is None` 之外的假值判断当成「识别失败」, 直接回退到基础价。
         """
-        base_price = self._config_int(self.CONF_FIXED_PRICE, 1)
+        base_price = self._config_int(CONF_FIXED_PRICE, 1)
         estimate = None
         if boxes is not None:
             estimate = self._read_stable_asset_value(
@@ -1579,7 +1398,7 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
             self.log_warning(f"当前估价识别失败, 第 {bid_count} 次出价回退到基础价 {base_price}")
             return base_price
 
-        ratio = self._config_float(self.CONF_ESTIMATE_RATIO, 1.0)
+        ratio = self._config_float(CONF_ESTIMATE_RATIO, 1.0)
         final_price = auction_price.estimate_price(estimate, ratio)
         if final_price <= 0:
             self.log_warning(
@@ -1593,11 +1412,11 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
 
     def _special_round_price(self, bid_count: int) -> int | None:
         """启用指定回合单独出价时返回该回合价格, 否则返回 None。"""
-        if not self.config.get(self.CONF_SPECIAL_ROUND, False):
+        if not self.config.get(CONF_SPECIAL_ROUND, False):
             return None
 
-        special_rounds = self._config_int_list(self.CONF_SPECIAL_ROUNDS)
-        special_price = self._config_int(self.CONF_SPECIAL_ROUND_PRICE, 0)
+        special_rounds = self._config_int_list(CONF_SPECIAL_ROUNDS)
+        special_price = self._config_int(CONF_SPECIAL_ROUND_PRICE, 0)
         price = auction_price.special_round_price(bid_count, special_rounds, special_price)
         if price is not None:
             self.log_info(f"指定回合 {bid_count} 使用单独价格 {price}")
@@ -1609,8 +1428,8 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         配置迁移已全部删除。旧配置或手工编辑留下的无效取值不能静默落到「自定义」分支,
         否则同一份价格配置会从指数增长变成线性增长, 所以直接回退到默认方式。
         """
-        mode = self.config.get(self.CONF_RAISE_MODE, self.RAISE_MODE_MULTIPLE)
-        return mode if mode in self.RAISE_MODES else self.RAISE_MODE_MULTIPLE
+        mode = self.config.get(CONF_RAISE_MODE, RAISE_MODE_MULTIPLE)
+        return mode if mode in RAISE_MODES else RAISE_MODE_MULTIPLE
 
     def _raise_price(self, base_price: int, bid_count: int) -> int:
         """按配置的加价方式计算第 bid_count 次出价的价格。
@@ -1619,8 +1438,8 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         这里负责读取配置、告警与回退基础价。
         """
         mode = self._raise_mode()
-        value = self._config_decimal(self.CONF_RAISE_VALUE, "0")
-        raise_round = self._config_int(self.CONF_RAISE_ROUND, 0)
+        value = self._config_decimal(CONF_RAISE_VALUE, "0")
+        raise_round = self._config_int(CONF_RAISE_ROUND, 0)
 
         # 未到配置的加价回合, 直接使用基础价.
         offset = auction_price.raise_offset(bid_count, raise_round)
@@ -1679,20 +1498,17 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
     def _can_reuse_last_bid(self, price: int) -> bool:
         """仅在未启用自动加价时复用上轮出价, 避免自动加价下快捷输入的不确定性。"""
         return (
-            not self.config.get(self.CONF_AUTO_RAISE, False)
+            not self.config.get(CONF_AUTO_RAISE, False)
             and self.last_bid_price is not None
             and price == self.last_bid_price
         )
 
     def _press_price_digits(self, price_str: str, deadline: float | None) -> None:
         """按数字键盘逐键点击, 优先使用 0000 / 00 快捷键。"""
-        for key in self._price_key_sequence(price_str):
+        for key in auction_price.price_key_sequence(price_str):
             if deadline is not None:
                 self._remaining_timeout(deadline, 0.1)
-            self.operate_click(self.box_of_screen(*self.PAD_MAP[key]), after_sleep=0.2)
-
-    # 按键序列纯函数唯一来源: src/tasks/auction/price.py。
-    _price_key_sequence = staticmethod(auction_price.price_key_sequence)
+            self.operate_click(self.box_of_screen(*PAD_MAP[key]), after_sleep=0.2)
 
     def _verify_input_price(self, boxes: AuctionBoxes, price: int, deadline: float | None) -> None:
         """校验数字面板显示的价格与目标价格一致, 不一致时抛出异常。
@@ -1719,7 +1535,7 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
             self.log_warning("价格区仍显示可输入范围提示, 视为未输入, 取消确认并重试当前出价")
             raise WaitFailedException("输入价格结果未识别")
 
-        input_price = self._parse_asset_value(raw_price)
+        input_price = auction_price.parse_asset_value(raw_price)
         self.log_debug(f"输入价格结果 OCR: '{raw_price}', 解析值: {input_price}")
         if input_price != price:
             self.log_warning(
@@ -1856,9 +1672,6 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
         """检测藏品仓库界面是否还在, 实现见 auction_sell.is_warehouse_open。"""
         return auction_sell.is_warehouse_open(self, boxes)
 
-    # 勾选是否被出售价值证实的纯判定, 唯一来源: src/tasks/auction/sell.py。
-    _is_selection_confirmed = staticmethod(auction_sell.is_selection_confirmed)
-
     def _sell_collections_with_escalation(
         self,
         boxes: AuctionBoxes,
@@ -1901,7 +1714,6 @@ class AutoBidAuctionTask(NTEOneTimeTask, BaseNTETask):
     # --- 表情包 ---
     def _send_emote(self) -> None:
         """发送表情菜单中的第一个表情。"""
-        self.log_info("发送表情包")
-        self.operate_click(*self.EMOTE_BTN, after_sleep=0.8)
-        self.operate_click(*self.EMOTE_FIRST, after_sleep=0.5)
+        self.operate_click(*EMOTE_BTN, after_sleep=0.8)
+        self.operate_click(*EMOTE_FIRST, after_sleep=0.5)
         self.log_info("表情包发送完成")

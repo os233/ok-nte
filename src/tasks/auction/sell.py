@@ -1,8 +1,9 @@
 """拍卖藏品出售能力: 模式判定, 间隔与满仓触发, 仓库流程, 品质筛选, 失败升级。
 
-模块函数的第一个参数 task 是 AutoBidAuctionTask 实例: OCR/输入/日志等框架 API、
-计时常量与跨轮状态 (_sell_failures / _inventory_stuck) 都经它访问。内部互相
-调用一律走 task._<方法名>, 让测试的实例级 mock 与任务侧的统一入口保持生效。
+模块函数的第一个参数 task 是 AutoBidAuctionTask 实例: OCR/输入/日志等框架 API
+与跨轮状态 (_sell_failures / _inventory_stuck) 都经它访问。出售域的行为常量
+由本模块定义, 不再挂回任务类。内部互相调用一律走 task._<方法名>, 让测试的
+实例级 mock 与任务侧的统一入口保持生效。
 
 跨轮状态的所有者仍是任务实例: _sell_failures 只按「满仓失败」累积, 成功清零;
 _inventory_stuck 置位会让下一轮跳过拍卖先重试清理。置位/清零条件见
@@ -12,6 +13,7 @@ run_with_escalation 的注释, 与拆分前逐字一致。
 from ok import TaskDisabledException, WaitFailedException
 
 from src.tasks.auction.layout import (
+    QUALITY_BOXES,
     RE_COLLECTION_INSUFFICIENT,
     RE_ONE_CLICK_SELL,
     RE_POPUP_CLOSE_HINT,
@@ -20,7 +22,44 @@ from src.tasks.auction.layout import (
     AuctionBoxes,
     PostRoundState,
 )
-from src.tasks.auction.options import SELL_MODE_OFF, SELL_MODE_ONE_CLICK, SELL_MODES
+from src.tasks.auction.options import (
+    CONF_SELL_INTERVAL,
+    QUALITY_KEYS,
+    SELL_MODE_INTERVAL,
+    SELL_MODE_OFF,
+    SELL_MODE_ONE_CLICK,
+    SELL_MODES,
+)
+
+# 品质圆点每点击一次界面会重绘, 间隔太短时后续点击会落空;
+# 勾选后读出售价值校验, 读到 0 或读不出时换帧重读, 最多尝试 SELL_SELECT_RETRIES 次.
+# 不能靠重新勾选来重试: 勾选是无条件点击, 再点一次会把刚勾上的品质全部点掉.
+SELL_QUALITY_GAP = 0.5
+SELL_SELECT_RETRIES = 2
+
+# 「出售价值」在品质圆点刚点完时会短暂变成空白(界面重绘), 只给 1 秒经常读空;
+# 读不出时返回 None, 调用方必须按「未确认」处理, 不能当成出售成功.
+SELL_VALUE_TIMEOUT = 3
+
+# 库存不足提示条出现时机不定, 给 1 秒容易漏掉(漏掉就不会提前清理, 满仓会卡住).
+# 满仓检测的本体是本模块的 detect_inventory_full, 低保观测用的也是这条预算.
+INVENTORY_FULL_TIMEOUT = 3
+
+# 出售连续失败到这个次数后放宽出售清单(6 个品质全卖)再试一次: 满仓卖不掉会让后续
+# 出价全部失败, 这时候把仓库腾空的优先级高于按低保阶段挑选品质.
+SELL_FAILURE_ESCALATE_AFTER = 2
+
+# 关闭藏品仓库的重试次数。批量关闭失败会把「出售模式 + 已勾选品质」留给下一轮,
+# 下次进来会无条件再点一遍同一批品质(全部取反), 必须确认真的关掉了。
+WAREHOUSE_CLOSE_RETRIES = 3
+# 藏品仓库入口与界面标题的等待上限。两者是同一段 UI 就绪过程(点入口 → 界面加载),
+# 用同一个上限, 免得调一处漏一处。
+WAREHOUSE_LOAD_TIMEOUT = 10
+
+# 结算界面的「一键出售」: 跳过动画刚点完, 按钮本来就该在, 给短超时即可.
+ONE_CLICK_SELL_TIMEOUT = 3
+# 点完一键出售要等服务端返回才弹出「获得物品」提示条, 给足时间.
+POPUP_CLOSE_TIMEOUT = 5
 
 
 def normalize_mode(raw_mode: str) -> str:
@@ -103,7 +142,7 @@ def on_settlement_screen(task, boxes: AuctionBoxes, deadline: float) -> None:
     单轮 deadline 用尽时按「没时间」跳过, 而不是抛异常: 结算已经完成, 不该因为
     时间不够把整轮判成失败。
     """
-    sell_timeout = task._timeout_or_zero(deadline, task.ONE_CLICK_SELL_TIMEOUT)
+    sell_timeout = task._timeout_or_zero(deadline, ONE_CLICK_SELL_TIMEOUT)
     if sell_timeout <= 0:
         task.log_warning("单轮时间已用尽, 跳过结算界面的「一键出售」")
         return
@@ -114,7 +153,7 @@ def on_settlement_screen(task, boxes: AuctionBoxes, deadline: float) -> None:
         return
     task.log_info("已点击一键出售")
 
-    popup_timeout = task._timeout_or_zero(deadline, task.POPUP_CLOSE_TIMEOUT)
+    popup_timeout = task._timeout_or_zero(deadline, POPUP_CLOSE_TIMEOUT)
     if popup_timeout <= 0:
         task.log_warning("单轮时间已用尽, 「获得物品」提示未处理")
         return
@@ -154,9 +193,9 @@ def run_on_interval(
 
     mode = task._sell_mode()
     sell_interval = 0
-    if mode == task.SELL_MODE_INTERVAL:
+    if mode == SELL_MODE_INTERVAL:
         sell_interval = task._config_int(
-            task.CONF_SELL_INTERVAL, 0, warn="出售间隔次数配置无效, 按满仓清理处理"
+            CONF_SELL_INTERVAL, 0, warn="出售间隔次数配置无效, 按满仓清理处理"
         )
         if sell_interval <= 0:
             # 间隔无效时退化成「满仓时清理」, 而不是直接不出售.
@@ -168,7 +207,7 @@ def run_on_interval(
         # 结算后观测没测出满仓结论(含当时 deadline 用尽)时在这里补测:
         # 本方法在轮次末尾调用, deadline 为空, 有完整的 INVENTORY_FULL_TIMEOUT 可用。
         inventory_full = task._detect_inventory_full(
-            boxes, task._timeout_or_zero(deadline, task.INVENTORY_FULL_TIMEOUT)
+            boxes, task._timeout_or_zero(deadline, INVENTORY_FULL_TIMEOUT)
         )
 
     reached_interval = sell_interval > 0 and task.current_round % sell_interval == 0
@@ -219,24 +258,24 @@ def run_collections(
         warehouse_button = task._wait_operate_click(
             boxes.warehouse_btn,
             RE_WAREHOUSE,
-            task._bounded_timeout(deadline, task.WAREHOUSE_LOAD_TIMEOUT),
+            task._bounded_timeout(deadline, WAREHOUSE_LOAD_TIMEOUT),
         )
         if not warehouse_button:
             task.log_warning("藏品仓库入口未出现, 取消出售流程")
             return None
         task._bounded_sleep(deadline, 1)
-        task.log_info("藏品仓库入口已点击")
+        task.log_debug("藏品仓库入口已点击")
 
         if not task.wait_ocr(
             box=boxes.warehouse_title,
             match=RE_WAREHOUSE,
-            time_out=task._bounded_timeout(deadline, task.WAREHOUSE_LOAD_TIMEOUT),
+            time_out=task._bounded_timeout(deadline, WAREHOUSE_LOAD_TIMEOUT),
             raise_if_not_found=False,
             settle_time=0.5,
         ):
             task.log_warning("藏品仓库界面加载失败, 取消出售流程")
             return None
-        task.log_info("藏品仓库界面加载完成")
+        task.log_debug("藏品仓库界面加载完成")
 
         # 上一次出售中途失败会把仓库留在出售模式, 此时「出售」圆钮的位置是「取消」,
         # 再点一次会退出出售模式, 后续品质勾选与确认出售全部落空却不报错.
@@ -251,11 +290,11 @@ def run_collections(
         sell_value = task._ensure_sell_value(boxes, deadline, selected, sell_qualities)
         # 只有读到正数才算勾选生效: 读到 0 或读不出(界面重绘中的空白态)都不能算成功,
         # 否则会在毫无证据的情况下打印「藏品出售完成」, 掩盖「一个品质都没勾上」.
-        selection_ok = task._is_selection_confirmed(selected, sell_value, require_sale=require_sale)
+        selection_ok = is_selection_confirmed(selected, sell_value, require_sale=require_sale)
 
         task.operate_click(boxes.confirm_sell, after_sleep=0)
         task._bounded_sleep(deadline, 1.5)
-        task.log_info("已点击确认出售")
+        task.log_debug("已点击确认出售")
 
         task.operate_click(boxes.blank, after_sleep=0)
         task._bounded_sleep(deadline, 0.5)
@@ -304,13 +343,11 @@ def close_warehouse(task, boxes: AuctionBoxes) -> None:
     一遍同一批品质 —— 全部取反成未勾选, 满仓放宽时还会连带卖掉用户明确保留的品质。
     关不掉时只告警不抛: 这里是异常收尾路径, 再抛异常会盖掉真正的失败原因。
     """
-    for attempt in range(1, task.WAREHOUSE_CLOSE_RETRIES + 1):
+    for attempt in range(1, WAREHOUSE_CLOSE_RETRIES + 1):
         task.operate_click(boxes.close, after_sleep=0.5)
         if not task._is_warehouse_open(boxes):
             return
-        task.log_warning(
-            f"第 {attempt}/{task.WAREHOUSE_CLOSE_RETRIES} 次点击关闭后藏品仓库仍未收起"
-        )
+        task.log_warning(f"第 {attempt}/{WAREHOUSE_CLOSE_RETRIES} 次点击关闭后藏品仓库仍未收起")
     task.log_warning("藏品仓库界面多次尝试后仍未关闭, 下一轮可能受残留勾选影响")
 
 
@@ -351,14 +388,18 @@ def select_quality_filters(
     """
     sell = set(sell_qualities)
     clicked = 0
+    # 逐项「保留/选择」只留在 DEBUG; INFO 记一次汇总, 避免品质多时每轮刷屏.
+    task.log_info(
+        f"勾选出售品质: {', '.join(sell_qualities) if sell_qualities else '无'}"
+    )
 
-    for quality_name, quality_pos in zip(task.QUALITY_KEYS, task.QUALITY_BOXES):
+    for quality_name, quality_pos in zip(QUALITY_KEYS, QUALITY_BOXES):
         if quality_name not in sell:
-            task.log_info(f"保留{quality_name}")
+            task.log_debug(f"保留{quality_name}")
             continue
-        task.log_info(f"选择{quality_name}")
+        task.log_debug(f"选择{quality_name}")
         task.operate_click(task.box_of_screen(*quality_pos), after_sleep=0)
-        task._bounded_sleep(deadline, task.SELL_QUALITY_GAP)
+        task._bounded_sleep(deadline, SELL_QUALITY_GAP)
         clicked += 1
 
     return clicked
@@ -396,16 +437,14 @@ def ensure_sell_value(
         # 没有任何品质需要出售, 不必校验, 也不必花时间读数值.
         return None
 
-    retries = max(task.SELL_SELECT_RETRIES, 1)
+    retries = max(SELL_SELECT_RETRIES, 1)
     value: int | None = None
     for attempt in range(retries):
         if attempt > 0:
             # 必须换帧: 两次读取落在同一帧上会读到同样的空白值.
             task.next_frame()
-            task._bounded_sleep(deadline, task.SELL_QUALITY_GAP)
-        value = task._read_sell_value(
-            boxes, task._bounded_timeout(deadline, task.SELL_VALUE_TIMEOUT)
-        )
+            task._bounded_sleep(deadline, SELL_QUALITY_GAP)
+        value = task._read_sell_value(boxes, task._bounded_timeout(deadline, SELL_VALUE_TIMEOUT))
         if value is None:
             # 界面重绘中的空白态, 重读一次再放弃.
             task.log_warning("出售价值未读出, 无法确认品质勾选是否生效")
@@ -421,9 +460,7 @@ def ensure_sell_value(
         # 的结果一样(都卖不掉), 不会更糟; 无限重试没有意义.
         task.log_warning("换帧重读后出售价值仍为 0, 按残留勾选被点掉处理, 重新勾选一次")
         task._select_quality_filters(deadline, sell_qualities)
-        value = task._read_sell_value(
-            boxes, task._bounded_timeout(deadline, task.SELL_VALUE_TIMEOUT)
-        )
+        value = task._read_sell_value(boxes, task._bounded_timeout(deadline, SELL_VALUE_TIMEOUT))
         if value is None:
             task.log_warning("重新勾选后出售价值未读出, 本次出售是否生效无法确认")
         elif value <= 0:
@@ -477,10 +514,10 @@ def run_with_escalation(
     计数达到阈值后以放宽集合开局(use_escalated): 否则第一次调用就超时的话,
     放宽分支永远走不到。
     """
-    escalated = sorted(set(sell_qualities) | set(task.QUALITY_KEYS))
+    escalated = sorted(set(sell_qualities) | set(QUALITY_KEYS))
     # 已经达到放宽阈值时直接用放宽集合开局: 满仓耗尽 SELL_TIMEOUT 会让第一次调用就抛
     # 异常, 永远走不到下面的放宽分支, 计数累到阈值也没有用.
-    use_escalated = inventory_full and task._sell_failures >= task.SELL_FAILURE_ESCALATE_AFTER
+    use_escalated = inventory_full and task._sell_failures >= SELL_FAILURE_ESCALATE_AFTER
     if use_escalated:
         task.log_warning(f"藏品出售已连续 {task._sell_failures} 次未完成, 直接放宽出售清单")
 
@@ -524,7 +561,7 @@ def run_with_escalation(
         return False
 
     task._sell_failures += 1
-    if task._sell_failures < task.SELL_FAILURE_ESCALATE_AFTER:
+    if task._sell_failures < SELL_FAILURE_ESCALATE_AFTER:
         # 本次失败用的是未放宽清单, 还轮不到放宽.
         task.log_warning(f"藏品出售未完成 (满仓连续 {task._sell_failures} 次)")
         task._inventory_stuck = inventory_full

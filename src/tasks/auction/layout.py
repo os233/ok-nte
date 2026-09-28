@@ -6,6 +6,7 @@ AuctionBoxes 一次性构造后传给流程方法 (见 AutoBidAuctionTask._build
 """
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 
@@ -253,3 +254,48 @@ PAD_MAP = {
 # 表情包点击坐标 (相对坐标, 非 Box).
 EMOTE_BTN = (0.036, 0.910)
 EMOTE_FIRST = (0.164, 0.516)
+
+
+def build_boxes(screen: Callable[..., Box]) -> AuctionBoxes:
+    """按相对比例一次性构建单轮拍卖使用的全部 UI 区域。
+
+    screen 是任务侧的 `box_of_screen`: 接受相对比例元组, 返回屏幕实际 Box。
+    区域数值全部来自本模块上方的 BOX_* 常量, 任务类不再保留副本。
+    """
+    return AuctionBoxes(
+        match=screen(*BOX_MATCH),
+        confirm=screen(*BOX_CONFIRM),
+        bid=screen(*BOX_BID),
+        bid_keypad=screen(*BOX_BID_KEYPAD),
+        skip_area=screen(*BOX_SKIP_AREA),
+        exit=screen(*BOX_EXIT),
+        bid_confirm=screen(*BOX_BID_CONFIRM),
+        abandon=screen(*BOX_ABANDON),
+        abandon_confirm=screen(*BOX_ABANDON_CONFIRM),
+        asset_value=screen(*BOX_ASSET_VALUE),
+        estimate=screen(*BOX_ESTIMATE),
+        last_bid=screen(*BOX_LAST_BID),
+        clear=screen(*BOX_CLEAR),
+        price_result=screen(*BOX_PRICE_RESULT),
+        price_result_keypad=screen(*BOX_PRICE_RESULT_KEYPAD),
+        exception_area=screen(*BOX_EXCEPTION_AREA),
+        main_title=screen(*BOX_MAIN_TITLE),
+        main_asset=screen(*BOX_MAIN_ASSET),
+        insufficient=screen(*BOX_INSUFFICIENT),
+        welfare_btn=screen(*BOX_WELFARE_BTN),
+        welfare_dialog=screen(*BOX_WELFARE_DIALOG),
+        welfare_counter=screen(*BOX_WELFARE_COUNTER),
+        claim=screen(*BOX_CLAIM),
+        cancel=screen(*BOX_CANCEL),
+        warehouse_btn=screen(*BOX_WAREHOUSE_BTN),
+        warehouse_title=screen(*BOX_WAREHOUSE_TITLE),
+        sell=screen(*BOX_SELL),
+        confirm_sell=screen(*BOX_CONFIRM_SELL),
+        sell_label=screen(*BOX_SELL_LABEL),
+        sell_value=screen(*BOX_SELL_VALUE),
+        blank=screen(*BOX_BLANK),
+        close=screen(*BOX_CLOSE),
+        one_click_sell=screen(*BOX_ONE_CLICK_SELL),
+        popup_close_hint=screen(*BOX_POPUP_CLOSE_HINT),
+        popup_blank=screen(*BOX_POPUP_BLANK),
+    )

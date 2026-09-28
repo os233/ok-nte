@@ -1,9 +1,10 @@
 """拍卖低保金与结算后处理: 弹窗领取, 次数读数, 跨日重置, 结算观测编排。
 
-模块函数的第一个参数 task 是 AutoBidAuctionTask 实例: OCR/输入/日志等框架 API、
-计时常量与当日领取记录 (_welfare_day / _welfare_claims_today /
-_welfare_daily_limit) 都经它访问; 记录的所有者仍是任务实例, 由弹窗读数整体覆盖。
-内部互相调用一律走 task._<方法名>, 让测试的实例级 mock 与任务侧的统一入口保持生效。
+模块函数的第一个参数 task 是 AutoBidAuctionTask 实例: OCR/输入/日志等框架 API
+与当日领取记录 (_welfare_day / _welfare_claims_today / _welfare_daily_limit)
+都经它访问; 记录的所有者仍是任务实例, 由弹窗读数整体覆盖。低保域的行为常量
+由本模块定义, 不再挂回任务类。内部互相调用一律走 task._<方法名>, 让测试的
+实例级 mock 与任务侧的统一入口保持生效。
 
 与出售策略的连接是显式的: 出售清单按「今日低保是否领完」切换(任务侧
 _sell_qualities 读 quota_exhausted 的结论), 观测编排只负责把满仓/资产观测和
@@ -24,6 +25,25 @@ from src.tasks.auction.layout import (
     AuctionBoxes,
     PostRoundState,
 )
+from src.tasks.auction.options import ASSIST_WELFARE
+
+# 资产低于该值时领取低保金.
+WELFARE_ASSET_THRESHOLD = 100000
+
+# 低保金弹窗关闭重试次数, 每日次数用尽时弹窗没有领取按钮, 只能靠取消关闭.
+WELFARE_CLOSE_RETRIES = 3
+
+# 低保金每日刷新时刻(游戏每日 5 点重置, 与 src/config.py 的「Monthly Card Time」默认值一致)。
+# 只用于跨天清空当日领取记录; 具体次数与上限一律以弹窗读数「今日已领取次数：N/5」为准,
+# 所以这里不写死「每日 5 次」—— 游戏改上限时不需要跟着改代码。
+WELFARE_RESET_HOUR = 5
+# 弹窗次数读数最多读几帧、换帧间隔多少秒。只读一帧时弹窗淡入中的空白帧会让这次
+# 读数落空, 而资产涨过 10 万后弹窗不再打开, 当天就再也读不到了(追加出售静默失效)。
+WELFARE_COUNTER_READS = 2
+WELFARE_COUNTER_RETRY_GAP = 0.3
+
+# 主界面资产观测的单次超时。观测每轮都要做, 给太长会拖累单轮总预算。
+ASSET_OBSERVE_TIMEOUT = 5
 
 
 def quota_exhausted(claims_today: int, daily_limit: int | None) -> bool:
@@ -46,7 +66,7 @@ def rollover_day(task) -> None:
     是同一个小时)。按午夜切会让 0~5 点这段被当成新的一天, 方向是「以为还能领 →
     不追加出售」, 虽然保守, 但会让这几轮白等一次弹窗读数。
     """
-    day = (datetime.now() - timedelta(hours=task.WELFARE_RESET_HOUR)).date()
+    day = (datetime.now() - timedelta(hours=WELFARE_RESET_HOUR)).date()
     if task._welfare_day == day:
         return
 
@@ -75,14 +95,14 @@ def read_counter(task, boxes: AuctionBoxes, deadline: float | None = None) -> No
     追加出售静默失效)。多花 0.3 秒换掉这个静默失效是划算的。
     """
     found = None
-    for attempt in range(1, task.WELFARE_COUNTER_READS + 1):
+    for attempt in range(1, WELFARE_COUNTER_READS + 1):
         texts = [box.name for box in task.ocr(box=boxes.welfare_counter, match=None)]
         found = RE_WELFARE_COUNTER.search("".join(texts).translate(FULLWIDTH_NUMERIC))
         if found is not None:
             break
-        if attempt < task.WELFARE_COUNTER_READS:
+        if attempt < WELFARE_COUNTER_READS:
             task.next_frame()
-            task._bounded_sleep(deadline, task.WELFARE_COUNTER_RETRY_GAP)
+            task._bounded_sleep(deadline, WELFARE_COUNTER_RETRY_GAP)
 
     if found is None:
         task.log_debug("低保金领取次数读数失败, 保持上次记录")
@@ -110,24 +130,24 @@ def close_dialog(task, boxes: AuctionBoxes, deadline: float | None) -> bool:
     后续所有阶段的识别都会被挡住。这里以界面特征判定弹窗是否还在, 反复点击取消,
     直到弹窗消失或重试次数用尽。
     """
-    for attempt in range(1, task.WELFARE_CLOSE_RETRIES + 1):
+    # 循环走完(break 未发生)即重试用尽, 只有两个 break 点算关闭成功, 成功日志只记一次.
+    for attempt in range(1, WELFARE_CLOSE_RETRIES + 1):
         if not task._is_welfare_dialog_open(boxes):
-            task.log_info("低保金弹窗已关闭")
-            return True
+            break
 
         task._wait_click_optional(boxes.cancel, RE_CANCEL, deadline, 3, "取消按钮")
         task._bounded_sleep(deadline, 0.5)
 
         if not task._is_welfare_dialog_open(boxes):
-            task.log_info("低保金弹窗已关闭")
-            return True
+            break
 
-        task.log_warning(
-            f"第 {attempt}/{task.WELFARE_CLOSE_RETRIES} 次点击取消后低保金弹窗仍未关闭"
-        )
+        task.log_warning(f"第 {attempt}/{WELFARE_CLOSE_RETRIES} 次点击取消后低保金弹窗仍未关闭")
+    else:
+        task.log_warning("低保金弹窗多次尝试后仍未关闭")
+        return False
 
-    task.log_warning("低保金弹窗多次尝试后仍未关闭")
-    return False
+    task.log_info("低保金弹窗已关闭")
+    return True
 
 
 def try_claim(task, boxes: AuctionBoxes, deadline: float | None = None) -> bool:
@@ -140,7 +160,6 @@ def try_claim(task, boxes: AuctionBoxes, deadline: float | None = None) -> bool:
     否则弹窗会一直盖住拍卖界面, 让后续所有阶段都识别不到。
     """
     try:
-        task.log_info("执行低保金领取流程")
         if not task._wait_click_optional(boxes.welfare_btn, RE_WELFARE, deadline, 5, "低保金按钮"):
             return False
         task._bounded_sleep(deadline, 0.5)
@@ -151,7 +170,7 @@ def try_claim(task, boxes: AuctionBoxes, deadline: float | None = None) -> bool:
 
         if task._wait_click_optional(boxes.claim, RE_CLAIM, deadline, 5, "领取按钮"):
             task._bounded_sleep(deadline, 0.5)
-            task.log_info("已点击领取按钮")
+            task.log_debug("已点击领取按钮")
             # 点击已发出不代表领取已生效: 盲目 +1 会在点击落空时虚增当日次数,
             # 提前按「已领完」放开出售, 抬高资产后弹窗不再打开, 当天剩下的低保
             # 就领不到 —— 而且这次读数之后再无弹窗, 计数无法自愈。弹窗还开着,
@@ -186,11 +205,11 @@ def claim_if_needed(task, boxes: AuctionBoxes, deadline: float, asset_value: int
         task.log_warning("资产值识别失败, 跳过本次低保金领取")
         return False
 
-    if asset_value >= task.WELFARE_ASSET_THRESHOLD:
-        task.log_info(f"资产达到{task.WELFARE_ASSET_THRESHOLD}, 跳过低保金领取")
+    if asset_value >= WELFARE_ASSET_THRESHOLD:
+        task.log_info(f"资产达到{WELFARE_ASSET_THRESHOLD}, 跳过低保金领取")
         return False
 
-    task.log_info(f"资产低于{task.WELFARE_ASSET_THRESHOLD}, 执行低保金领取")
+    task.log_info(f"资产低于{WELFARE_ASSET_THRESHOLD}, 执行低保金领取")
     return task._try_claim_welfare(boxes, deadline)
 
 
@@ -205,7 +224,7 @@ def observe_main_asset(task, boxes: AuctionBoxes, deadline: float) -> int | None
     单轮时间用尽时只表示这次没测到, 不该抛 WaitFailedException —— 那会把已经成功
     结算的轮次判成失败, 而且调用方写回观测结果的那一步会被跳过, 连出售也一并丢失。
     """
-    timeout = task._timeout_or_zero(deadline, task.ASSET_OBSERVE_TIMEOUT)
+    timeout = task._timeout_or_zero(deadline, ASSET_OBSERVE_TIMEOUT)
     if timeout <= 0:
         task.log_debug("资产观测没有可用时间, 跳过本次读取")
         return None
@@ -249,8 +268,13 @@ def observe_post_round(task, boxes: AuctionBoxes, deadline: float) -> None:
     task._run_post_round_actions(boxes, deadline)
 
 
-def run_post_round_actions(task, boxes: AuctionBoxes, deadline: float) -> None:
+def run_post_round_actions(
+    task, boxes: AuctionBoxes, deadline: float, *, inventory_full_timeout: float
+) -> None:
     """结算后回到主界面时的辅助操作: 观测满仓状态并领取低保金。
+
+    满仓观测预算 inventory_full_timeout 由任务编排层授予, 与出售域
+    detect_inventory_full 共用同一条预算; 本模块不直接依赖出售模块。
 
     库存不足提示位于屏幕中部, 会被低保金弹窗遮挡, 因此必须在打开弹窗之前检测。
 
@@ -269,7 +293,7 @@ def run_post_round_actions(task, boxes: AuctionBoxes, deadline: float) -> None:
     if task._uses_collection_sell():
         # 观测步骤没有可用时间时返回 None, 不抛异常.
         inventory_full = task._detect_inventory_full(
-            boxes, task._timeout_or_zero(deadline, task.INVENTORY_FULL_TIMEOUT)
+            boxes, task._timeout_or_zero(deadline, inventory_full_timeout)
         )
 
     # 资产观测无条件执行, 与低保金开关无关: 这是独立的长期记录功能。
@@ -278,7 +302,7 @@ def run_post_round_actions(task, boxes: AuctionBoxes, deadline: float) -> None:
 
     # 领取结果不再参与出售决策: 追加出售看的是「今日低保是否领完」(任务级状态,
     # 由弹窗读数维护), 不是「本轮有没有领到」。这里只负责把领取流程走完。
-    if task._assist_enabled(task.ASSIST_WELFARE):
+    if task._assist_enabled(ASSIST_WELFARE):
         try:
             task._claim_welfare_if_needed(boxes, deadline, asset_value)
         except TaskDisabledException:

@@ -1,9 +1,10 @@
 """拍卖掉线回场与弹窗恢复: 大世界探测, 回场路径, 入口确认, 阻塞弹窗兜底。
 
-模块函数的第一个参数 task 是 AutoBidAuctionTask 实例: OCR/输入/导航等框架 API、
-计时常量与本轮回场配额 (_recover_quota, 由 _exec_auction_round 每轮重置) 都经
-它访问; 配额的所有者是任务实例。内部互相调用一律走 task._<方法名>, 让测试的
-实例级 mock 与任务侧的统一入口保持生效。
+模块函数的第一个参数 task 是 AutoBidAuctionTask 实例: OCR/输入/导航等框架 API
+与本轮回场配额 (_recover_quota, 由 _exec_auction_round 每轮重置) 都经它访问;
+配额的所有者是任务实例。回场预算等行为常量由本模块定义, 不再挂回任务类。
+内部互相调用一律走 task._<方法名>, 让测试的实例级 mock 与任务侧的统一入口
+保持生效。
 
 预算规则与迁移前一致: 回场路径的每一步都按「剩余预算」取超时 (见
 return_to_auction 的注释), 回场成功后重跑匹配阶段用的是调用方传入的同一份
@@ -15,12 +16,33 @@ import time
 from ok import TaskDisabledException, WaitFailedException
 
 from src.tasks.auction.layout import (
+    BOX_CITY_FUN_CARDS,
+    BOX_CITY_FUN_TITLE,
+    BOX_CURRENT_VENUE,
+    POS_CITY_FUN_SCROLL,
     RE_CITY_FUN,
     RE_CURRENT_VENUE,
     RE_MAIN_TITLE,
     AuctionBoxes,
     AuctionState,
 )
+
+# --- 掉线回场 (秒/次) ---
+# 网络不稳时匹配阶段会被踢回大世界, 界面状态全不命中, 只能空转到 MATCH_TIMEOUT。
+# 回场是一次性的异常路径: 失败就按本轮失败处理, 交给下一轮重试。
+RECOVER_TIMEOUT = 90  # 单次回场总预算
+RECOVER_STEP_TIMEOUT = 12  # 回场各步骤的等待上限
+RECOVER_SCROLL_STEPS = 4  # 「都市闲趣」面板最多滚动几次去找「即刻落槌」
+RECOVER_SCROLL_WHEEL = -8  # 每次滚动的滚轮格数
+# 单轮回场次数上限, 由 _exec_auction_round 写进 self._recover_quota 并扣减。
+# 挂在轮次而不是调用参数上的原因见 AutoBidAuctionTask._exec_auction_round: 参数会在
+# 「确认失败后重跑 _stage_match」的路径上被默认值恢复, 使同一轮可以反复回场, 每次都
+# 重走一遍面板动画把整轮 deadline 耗光, 并且让「本轮只回场一次」这个约定形同虚设。
+RECOVER_MAX_PER_ROUND = 1
+# 启动时的入口回场 (见 ensure_auction_entry): 探测主界面标题的等待上限,
+# 以及一次性回场预算。预算与 RECOVER_TIMEOUT 一致, 两者走的是同一条路径。
+ENTRY_PROBE_TIMEOUT = 3
+ENTRY_RECOVER_TIMEOUT = 90
 
 
 def blocking_popup(task, boxes: AuctionBoxes | None = None) -> None:
@@ -103,7 +125,7 @@ def recover_from_world(task, boxes: AuctionBoxes, deadline: float) -> AuctionSta
     """
     task.log_warning("检测到被踢回大世界, 尝试自动回到拍卖界面")
     task.info_set("当前阶段", "回场中")
-    recover_deadline = min(deadline, time.monotonic() + task.RECOVER_TIMEOUT)
+    recover_deadline = min(deadline, time.monotonic() + RECOVER_TIMEOUT)
     if not task._return_to_auction(boxes, recover_deadline):
         raise WaitFailedException("被踢回大世界后未能回到拍卖界面")
 
@@ -147,9 +169,9 @@ def return_to_auction(task, boxes: AuctionBoxes, deadline: float) -> bool:
 
         task.operate_click(*task.pos.panels.f5.hobbies)
         if not task.wait_ocr(
-            box=task.box_of_screen(*task.BOX_CITY_FUN_TITLE),
+            box=task.box_of_screen(*BOX_CITY_FUN_TITLE),
             match=RE_CITY_FUN,
-            time_out=task._timeout_or_zero(deadline, task.RECOVER_STEP_TIMEOUT),
+            time_out=task._timeout_or_zero(deadline, RECOVER_STEP_TIMEOUT),
             raise_if_not_found=False,
             settle_time=0.5,
         ):
@@ -161,7 +183,7 @@ def return_to_auction(task, boxes: AuctionBoxes, deadline: float) -> bool:
             task.wait_ocr(
                 box=boxes.main_title,
                 match=RE_MAIN_TITLE,
-                time_out=task._timeout_or_zero(deadline, task.RECOVER_STEP_TIMEOUT),
+                time_out=task._timeout_or_zero(deadline, RECOVER_STEP_TIMEOUT),
                 raise_if_not_found=False,
                 settle_time=0.5,
             )
@@ -194,8 +216,8 @@ def click_instant_lot(task, deadline: float) -> bool:
     命中后直接点 OCR 框中心 —— 卡片是「上图下标题」, 标题本身就在卡片的点击热区内。
     复用 RE_MAIN_TITLE 是因为卡片名与拍卖主界面标题是同一个词「即刻落槌」。
     """
-    cards = task.box_of_screen(*task.BOX_CITY_FUN_CARDS)
-    for _ in range(task.RECOVER_SCROLL_STEPS):
+    cards = task.box_of_screen(*BOX_CITY_FUN_CARDS)
+    for _ in range(RECOVER_SCROLL_STEPS):
         if task._wait_operate_click(
             cards,
             RE_MAIN_TITLE,
@@ -203,7 +225,7 @@ def click_instant_lot(task, deadline: float) -> bool:
             after_sleep=1,
         ):
             return True
-        task.scroll(*task.POS_CITY_FUN_SCROLL, task.RECOVER_SCROLL_WHEEL)
+        task.scroll(*POS_CITY_FUN_SCROLL, RECOVER_SCROLL_WHEEL)
         task.sleep(0.5)
     task.log_warning("都市闲趣面板里未找到「即刻落槌」入口")
     return False
@@ -212,7 +234,7 @@ def click_instant_lot(task, deadline: float) -> bool:
 def read_current_venue(task) -> str:
     """读拍卖主界面右侧的「当前：XXX场」, 只用于在日志里留痕, 读不出返回空串。"""
     try:
-        results = task.ocr(box=task.box_of_screen(*task.BOX_CURRENT_VENUE), match=RE_CURRENT_VENUE)
+        results = task.ocr(box=task.box_of_screen(*BOX_CURRENT_VENUE), match=RE_CURRENT_VENUE)
     except TaskDisabledException:
         raise
     except Exception as e:
@@ -244,7 +266,7 @@ def ensure_auction_entry(task, boxes: AuctionBoxes) -> None:
     if task.wait_ocr(
         box=boxes.main_title,
         match=RE_MAIN_TITLE,
-        time_out=task.ENTRY_PROBE_TIMEOUT,
+        time_out=ENTRY_PROBE_TIMEOUT,
         raise_if_not_found=False,
     ):
         return
@@ -252,5 +274,5 @@ def ensure_auction_entry(task, boxes: AuctionBoxes) -> None:
         return
     task.log_info("启动时检测到大世界, 自动进入「即刻落槌」")
     task.info_set("当前阶段", "入场中")
-    if not task._return_to_auction(boxes, time.monotonic() + task.ENTRY_RECOVER_TIMEOUT):
+    if not task._return_to_auction(boxes, time.monotonic() + ENTRY_RECOVER_TIMEOUT):
         task.log_warning("启动回场未成功, 交给第一轮按界面异常处理")
