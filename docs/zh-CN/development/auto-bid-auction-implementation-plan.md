@@ -41,7 +41,7 @@
 - 新建 `src/tasks/auction/` 包。
 - 将默认配置、控件类型、条件可见配置和说明迁至 `options.py`。
 - 将 `AuctionBoxes` 与拍卖区域定义迁至 `layout.py`。
-- 在 `AutoBidAuctionTask` 保留 `CONF_*`、`BOX_*` 等兼容引用。
+- 在 `AutoBidAuctionTask` 保留 `CONF_*`、`BOX_*` 等兼容引用。（后续更新 2026-09-28: 过渡别名已收掉, 任务类与测试直接从子包导入, 该步骤不再适用, 见 `auto-bid-auction-refactor.md`「1. 配置声明」。）
 - 保持 `src/config.py` 的任务注册路径不变。
 
 ### 验收标准
